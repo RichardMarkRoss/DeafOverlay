@@ -16,6 +16,8 @@
 
 #pragma comment(lib, "Dwmapi.lib")
 
+enum : int { HK_TOGGLE_VIS = 1, HK_OPEN_SETTINGS = 2 };
+
 static const wchar_t* kClassName = L"DeafOverlayWnd";
 
 /* ===================== DIB ===================== */
@@ -308,6 +310,8 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     DwmSetWindowAttribute(hWnd, 2 /*NCRenderingPolicy*/, &noShadow, sizeof(noShadow));
 
     ShowWindow(hWnd, SW_SHOWNA);
+    RegisterHotKey(hWnd, HK_TOGGLE_VIS, MOD_CONTROL | MOD_ALT, 'H');
+    RegisterHotKey(hWnd, HK_OPEN_SETTINGS, MOD_CONTROL | MOD_ALT, 'O');
     UpdateWindow(hWnd);
 
     g_dib = make_dib(W, H);
@@ -315,14 +319,52 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     bool dragging = false; POINT last{};
     auto t0 = std::chrono::steady_clock::now();
     float tPrev = 0.0f;
+    bool overlayVisible = true;
 
     MSG msg{};
     while (true) {
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) { free_dib(g_dib); return 0; }
+        // when registering:
+        RegisterHotKey(hWnd, HK_TOGGLE_VIS, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'H');
+        RegisterHotKey(hWnd, HK_OPEN_SETTINGS, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'O');
 
-            // Legacy ALT-drag (only when not in edit mode)
-            if (!g_editMode) {
+        // in the main loop:
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                free_dib(g_dib);
+                UnregisterHotKey(hWnd, HK_TOGGLE_VIS);
+                UnregisterHotKey(hWnd, HK_OPEN_SETTINGS);
+                return 0;
+            }
+
+            if (msg.message == WM_HOTKEY) {
+                if (msg.wParam == HK_TOGGLE_VIS) {
+                    overlayVisible = !overlayVisible;
+                    if (overlayVisible) {
+                        ShowWindow(hWnd, SW_SHOWNA);
+                        SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                        // (optional) re-enable click-through if you disabled it while hidden
+                        // SetWindowLongPtrW(hWnd, GWL_EXSTYLE,
+                        //   GetWindowLongPtrW(hWnd, GWL_EXSTYLE) | WS_EX_TRANSPARENT);
+                    }
+                    else {
+                        ShowWindow(hWnd, SW_HIDE);
+                        // (optional) turn off click-through while hidden if you want to interact with it later
+                        // SetWindowLongPtrW(hWnd, GWL_EXSTYLE,
+                        //   GetWindowLongPtrW(hWnd, GWL_EXSTYLE) & ~WS_EX_TRANSPARENT);
+                    }
+                }
+                else if (msg.wParam == HK_OPEN_SETTINGS) {
+                    MessageBoxW(hWnd,
+                        L"Settings placeholder:\n\n• Ring tilt\n• Ring thickness\n• Opacity\n• Audio device\n\n(Coming soon)",
+                        L"Overlay Settings", MB_OK | MB_ICONINFORMATION);
+                }
+                // We handled it; don't dispatch this message further.
+                continue;
+            }
+
+            // Drag only when overlay is visible and not in edit mode
+            if (overlayVisible && !g_editMode) {
                 if (msg.message == WM_LBUTTONDOWN && (GetKeyState(VK_MENU) & 0x8000)) {
                     dragging = true; GetCursorPos(&last);
                 }
