@@ -2,7 +2,7 @@
 add_executable(DeafOverlay
     DeafOverlay.cpp  # put the WinMain here (see sample below)
     # DeafOverlay.h  # optional
-)
+ "third_party/miniaudio.h")
 
 # C++20 and warnings
 set_target_properties(DeafOverlay PROPERTIES
