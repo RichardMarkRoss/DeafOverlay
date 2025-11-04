@@ -424,6 +424,33 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
             // Normalize amplitudes to 0..1 using soft knee
             auto norm = [](float v) { return std::tanh(1.2f * v); };
 
+            // TOP
+            {
+                float a = norm(0.7f * (L + R) * elevScore); // top based on elevScore
+                if (a > 0.01f) {
+                    Peak q; q.ang = PI_F * 0.5f; q.amp = a; q.life = 0.35f; q.band = b;
+                    q.rearGain = backScore; q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
+                    add_peak_merge(q);
+                }
+			}
+            //BOTTOM
+            {
+                float a = norm(0.4f * (L + R) * -elevScore); // bottom based on elevScore
+                if (a > 0.01f) {
+                    Peak q; q.ang = std::remainder(PI_F * 1.5f, 2 * PI_F); q.amp = a; q.life = 0.30f; q.band = b;
+                    q.rearGain = backScore; q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
+                    add_peak_merge(q);
+				}
+	        }
+			// CENTER
+            { 
+                float a = norm(0.6f * (L + R) * (1.f - std::fabs(elevScore))); // center based on lack of elevScore
+                if (a > 0.01f) {
+                    Peak q; q.ang = 0.f; q.amp = a; q.life = 0.40f; q.band = b;
+                    q.rearGain = backScore; q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
+                    add_peak_merge(q);
+				}
+			}
             // FRONT (12 o’clock)
             {
                 float a = norm(center);
@@ -432,6 +459,26 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
                     q.rearGain = backScore; q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
                     add_peak_merge(q);
                 }
+            }
+            // REAR (6 o’clock)
+            {
+                float a = norm(0.5f * ild * S); // rear based on ILD
+                if (a > 0.01f) {
+                    float ang = (ild >= 0.f) ? +maxAng : -maxAng;
+                    Peak q; q.ang = std::remainder(ang + PI_F, 2 * PI_F); q.amp = a; q.life = 0.40f; q.band = b;
+                    q.rearGain = backScore; q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
+                    add_peak_merge(q);
+                }
+			}
+			// FRONT LEFT
+            {
+                float a = norm(0.5f * (1.f - ild) * S); // front-left based on ILD
+                if (a > 0.01f) {
+                    float ang = -maxAng * 0.5f;
+                    Peak q; q.ang = ang; q.amp = a; q.life = 0.50f; q.band = b;
+                    q.rearGain = backScore; q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
+                    add_peak_merge(q);
+				}
             }
             // LEFT
             {
@@ -445,6 +492,25 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
                     add_peak_merge(q);
                 }
             }
+            // REAR LEFT
+            {
+                float a = norm(-0.5f * ild * S); // rear-left based on ILD
+                if (a > 0.01f) {
+                    float ang = std::remainder(-maxAng + PI_F, 2 * PI_F);
+                    Peak q; q.ang = ang; q.amp = a; q.life = 0.40f; q.band = b;
+                    q.rearGain = backScore; q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
+                    add_peak_merge(q);
+				}
+            //FRONT RIGHT
+            {
+                float a = norm(0.5f * (1.f + ild) * S); // front-right based on ILD
+                if (a > 0.01f) {
+                    float ang = +maxAng * 0.5f;
+                    Peak q; q.ang = ang; q.amp = a; q.life = 0.50f; q.band = b;
+                    q.rearGain = backScore; q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
+                    add_peak_merge(q);
+                }
+			}
             // RIGHT
             {
                 float a = norm(right);
@@ -456,6 +522,16 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
                     add_peak_merge(q);
                 }
             }
+            // REAR RIGHT
+            {
+                float a = norm(0.5f * ild * S); // rear-right based on ILD
+                if (a > 0.01f) {
+                    float ang = std::remainder(+maxAng + PI_F, 2 * PI_F);
+                    Peak q; q.ang = ang; q.amp = a; q.life = 0.40f; q.band = b;
+                    q.rearGain = backScore; q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
+                    add_peak_merge(q);
+                }
+			}
         }
 
         // Render
