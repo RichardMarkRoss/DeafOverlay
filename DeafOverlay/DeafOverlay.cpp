@@ -410,128 +410,102 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
 
         // Build peaks: for each band, emit Left, Center, Right
         for (int b = 0; b < NB; ++b) {
-            float L = EL[b], R = ER[b]; float S = L + R;
+            float L = EL[b], R = ER[b];
+            float S = L + R;
             if (S <= 1e-6f) continue;
 
-            float ild = (SWAP_LR ? (L - R) : (R - L)) / S;  // -1..+1 (right positive)
+            // ILD: right-positive in our azimuth convention (0=front, +right, -left)
+            float ild = (SWAP_LR ? (L - R) : (R - L)) / S;  // -1..+1
             ild = std::clamp(ild, -1.f, 1.f);
 
             // Components
-            float center = std::min(L, R);          // shared energy = mono/front
-            float left = std::max(0.f, L - R);   // unique left
-            float right = std::max(0.f, R - L);   // unique right
+            float center = std::min(L, R);          // shared = front
+            float left = std::max(0.f, L - R);    // unique left
+            float right = std::max(0.f, R - L);    // unique right
 
-            // Normalize amplitudes to 0..1 using soft knee
-            auto norm = [](float v) { return std::tanh(1.2f * v); };
+            auto norm = [](float v) { return std::tanh(1.2f * v); }; // soft knee
+            const float maxAng = MAX_AZIMUTH_DEG * PI_F / 180.f;
 
-            // TOP
-            {
-                float a = norm(0.7f * (L + R) * elevScore); // top based on elevScore
-                if (a > 0.01f) {
-                    Peak q; q.ang = PI_F * 0.5f; q.amp = a; q.life = 0.35f; q.band = b;
-                    q.rearGain = backScore; q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
-                    add_peak_merge(q);
-                }
-			}
-            //BOTTOM
-            {
-                float a = norm(0.4f * (L + R) * -elevScore); // bottom based on elevScore
-                if (a > 0.01f) {
-                    Peak q; q.ang = std::remainder(PI_F * 1.5f, 2 * PI_F); q.amp = a; q.life = 0.30f; q.band = b;
-                    q.rearGain = backScore; q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
-                    add_peak_merge(q);
-				}
-	        }
-			// CENTER
-            { 
-                float a = norm(0.6f * (L + R) * (1.f - std::fabs(elevScore))); // center based on lack of elevScore
-                if (a > 0.01f) {
-                    Peak q; q.ang = 0.f; q.amp = a; q.life = 0.40f; q.band = b;
-                    q.rearGain = backScore; q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
-                    add_peak_merge(q);
-				}
-			}
-            // FRONT (12 o’clock)
+            // -------- Front (12 o’clock) from mono/shared energy --------
             {
                 float a = norm(center);
                 if (a > 0.01f) {
-                    Peak q; q.ang = 0.f; q.amp = a; q.life = 0.45f; q.band = b;
-                    q.rearGain = backScore; q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
+                    Peak q; q.ang = 0.f; q.amp = a; q.life = 0.50f; q.band = b;
+                    q.rearGain = backScore;
+                    q.elevFactor = 1.0f + elevScore * ELEV_SCALE; // sphere brightness only
                     add_peak_merge(q);
                 }
             }
-            // REAR (6 o’clock)
-            {
-                float a = norm(0.5f * ild * S); // rear based on ILD
-                if (a > 0.01f) {
-                    float ang = (ild >= 0.f) ? +maxAng : -maxAng;
-                    Peak q; q.ang = std::remainder(ang + PI_F, 2 * PI_F); q.amp = a; q.life = 0.40f; q.band = b;
-                    q.rearGain = backScore; q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
-                    add_peak_merge(q);
-                }
-			}
-			// FRONT LEFT
-            {
-                float a = norm(0.5f * (1.f - ild) * S); // front-left based on ILD
-                if (a > 0.01f) {
-                    float ang = -maxAng * 0.5f;
-                    Peak q; q.ang = ang; q.amp = a; q.life = 0.50f; q.band = b;
-                    q.rearGain = backScore; q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
-                    add_peak_merge(q);
-				}
-            }
-            // LEFT
+
+            // -------- Left (continuous angle) --------
             {
                 float a = norm(left);
                 if (a > 0.01f) {
-                    // place within left span proportional to bias
-                    float frac = (L > 0.f ? (left / std::max(L, 1e-6f)) : 0.f); // 0..1
+                    // bias inside left arc; more unique-left -> closer to -maxAng
+                    float frac = (L > 0.f ? left / std::max(L, 1e-6f) : 0.f); // 0..1
                     float ang = -maxAng * std::clamp(0.35f + 0.65f * frac, 0.0f, 1.0f);
                     Peak q; q.ang = ang; q.amp = a; q.life = 0.55f; q.band = b;
-                    q.rearGain = backScore; q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
+                    q.rearGain = backScore;
+                    q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
                     add_peak_merge(q);
                 }
             }
-            // REAR LEFT
-            {
-                float a = norm(-0.5f * ild * S); // rear-left based on ILD
-                if (a > 0.01f) {
-                    float ang = std::remainder(-maxAng + PI_F, 2 * PI_F);
-                    Peak q; q.ang = ang; q.amp = a; q.life = 0.40f; q.band = b;
-                    q.rearGain = backScore; q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
-                    add_peak_merge(q);
-				}
-            //FRONT RIGHT
-            {
-                float a = norm(0.5f * (1.f + ild) * S); // front-right based on ILD
-                if (a > 0.01f) {
-                    float ang = +maxAng * 0.5f;
-                    Peak q; q.ang = ang; q.amp = a; q.life = 0.50f; q.band = b;
-                    q.rearGain = backScore; q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
-                    add_peak_merge(q);
-                }
-			}
-            // RIGHT
+
+            // -------- Right (continuous angle) --------
             {
                 float a = norm(right);
                 if (a > 0.01f) {
-                    float frac = (R > 0.f ? (right / std::max(R, 1e-6f)) : 0.f);
+                    float frac = (R > 0.f ? right / std::max(R, 1e-6f) : 0.f);
                     float ang = +maxAng * std::clamp(0.35f + 0.65f * frac, 0.0f, 1.0f);
                     Peak q; q.ang = ang; q.amp = a; q.life = 0.55f; q.band = b;
-                    q.rearGain = backScore; q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
+                    q.rearGain = backScore;
+                    q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
                     add_peak_merge(q);
                 }
             }
-            // REAR RIGHT
-            {
-                float a = norm(0.5f * ild * S); // rear-right based on ILD
-                if (a > 0.01f) {
-                    float ang = std::remainder(+maxAng + PI_F, 2 * PI_F);
-                    Peak q; q.ang = ang; q.amp = a; q.life = 0.40f; q.band = b;
-                    q.rearGain = backScore; q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
-                    add_peak_merge(q);
+
+            // -------- Rear mirrors (only if pinna suggests “rear”) --------
+            if (backScore > 0.12f) {
+                const float rearScale = std::clamp(backScore, 0.12f, 1.0f); // how strong the rear is
+
+                // Mirror FRONT
+                {
+                    float a = norm(center) * rearScale * 0.85f;
+                    if (a > 0.01f) {
+                        Peak q; q.ang = std::remainder(0.f + PI_F, 2 * PI_F);
+                        q.amp = a; q.life = 0.45f; q.band = b;
+                        q.rearGain = backScore;
+                        q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
+                        add_peak_merge(q);
+                    }
                 }
-			}
+                // Mirror LEFT
+                if (left > 0.0f) {
+                    float frac = (L > 0.f ? left / std::max(L, 1e-6f) : 0.f);
+                    float angL = -maxAng * std::clamp(0.35f + 0.65f * frac, 0.0f, 1.0f);
+                    float a = norm(left) * rearScale * 0.75f;
+                    if (a > 0.01f) {
+                        Peak q; q.ang = std::remainder(angL + PI_F, 2 * PI_F);
+                        q.amp = a; q.life = 0.45f; q.band = b;
+                        q.rearGain = backScore;
+                        q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
+                        add_peak_merge(q);
+                    }
+                }
+                // Mirror RIGHT
+                if (right > 0.0f) {
+                    float frac = (R > 0.f ? right / std::max(R, 1e-6f) : 0.f);
+                    float angR = +maxAng * std::clamp(0.35f + 0.65f * frac, 0.0f, 1.0f);
+                    float a = norm(right) * rearScale * 0.75f;
+                    if (a > 0.01f) {
+                        Peak q; q.ang = std::remainder(angR + PI_F, 2 * PI_F);
+                        q.amp = a; q.life = 0.45f; q.band = b;
+                        q.rearGain = backScore;
+                        q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
+                        add_peak_merge(q);
+                    }
+                }
+            }
         }
 
         // Render
