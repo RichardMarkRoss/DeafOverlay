@@ -1,8 +1,9 @@
-﻿// DeafOverlay.cpp — “Collect everything” spatial logic.
+﻿// DeafOverlay.cpp — “Collect everything” spatial logic (rear fixed, per-band pinna cues).
 // - Every band emits up to 3 peaks (Left, Front, Right).
 // - No mono suppression (center shows at 12 o’clock).
 // - Continuous azimuth for L/R from ILD per band.
-// - Smooth visuals kept (same renderer), rear/top hints kept.
+// - Rear mirroring is PER-BAND using a smoothed 5–8 kHz notch cue.
+// - Elevation only shapes the sphere brightness (not ring direction).
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -22,12 +23,12 @@
 #pragma comment(lib, "Dwmapi.lib")
 
 /* ===== Tunables ===== */
-static constexpr float SENSITY_GAIN = 0.95f;   // overall visual loudness
-static constexpr float MAX_AZIMUTH_DEG = 78.0f;   // per-side span on ring
-static constexpr float PEAK_DECAY_HZ = 1.7f;    // slower decay so peaks persist
-static constexpr float ELEV_SCALE = 0.30f;   // sphere top/bottom bias
-static constexpr float REAR_SCALE = 1.00f;   // rear trail strength
-static constexpr bool  SWAP_LR = false;   // flip if headset reversed
+static constexpr float SENSITY_GAIN = 0.95f;  // overall visual loudness
+static constexpr float MAX_AZIMUTH_DEG = 78.0f;  // per-side span on ring
+static constexpr float PEAK_DECAY_HZ = 1.7f;   // slower decay so peaks persist
+static constexpr float ELEV_SCALE = 0.30f;  // sphere top/bottom bias
+static constexpr float REAR_SCALE = 1.00f;  // rear trail strength
+static constexpr bool  SWAP_LR = false;  // flip if headset reversed
 
 /* ===== Audio (miniaudio) ===== */
 #define MINIAUDIO_IMPLEMENTATION
@@ -71,6 +72,7 @@ static std::atomic<float> gEL[NB], gER[NB];
 
 static inline float lp_step(float y, float x, float a) { return y + a * (x - y); }
 
+/* ===== Audio callback ===== */
 void MA_API audio_cb(ma_device* dev, void*, const void* pIn, ma_uint32 frames) {
     const float* s = (const float*)pIn; if (!s) return;
     const ma_uint32 ch = dev->capture.channels ? dev->capture.channels : 1;
@@ -177,7 +179,7 @@ static void add_peak_merge(const Peak& q) {
     g_peaks[slot] = q;
 }
 
-/* ==== Sphere & Ring (same visuals as before) ==== */
+/* ==== Sphere & Ring ==== */
 static void draw_sphere(void* bits, int w, int h, float cx, float cy, float radius, float tilt_deg);
 static void draw_ring(void* bits, int w, int h, float cx, float cy, float a, float b);
 
@@ -285,7 +287,7 @@ static void draw_sphere(void* bits, int w, int h, float cx, float cy, float radi
     }
 }
 
-/* ===== Window stuff (unchanged essentials) ===== */
+/* ===== Window stuff ===== */
 static bool g_editMode = false; static DIB g_dib{};
 static const wchar_t* kClassName = L"DeafOverlayWnd";
 enum : int { HK_TOGGLE_VIS = 1, HK_OPEN_SETTINGS = 2 };
@@ -338,6 +340,12 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
     }
 }
 
+/* ========= Pinna helpers (scene/band smoothing state) ========= */
+static float gBackB[NB] = { 0 };  // smoothed rear confidence per band
+static float gFrontB[NB] = { 0 };  // smoothed front confidence per band
+static float gElevS = 0.f;  // smoothed scene elevation
+static inline float ema(float prev, float x, float a) { return prev + a * (x - prev); }
+
 /* ===== Entry / main loop ===== */
 int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     using SetProcessDpiAwarenessContext_t = BOOL(WINAPI*)(HANDLE);
@@ -359,7 +367,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     g_dib = make_dib(W, H);
     audio_init();
 
-    bool overlayVisible = true, dragging = false; POINT last{};
+    bool overlayVisible = true;
     auto t0 = std::chrono::steady_clock::now(); float tPrev = 0.f;
 
     MSG msg{};
@@ -375,14 +383,6 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
                     MessageBoxW(h, L"Settings soon: sensitivity, L/R swap.", L"Overlay Settings", MB_OK | MB_ICONINFORMATION);
                 } continue;
             }
-            if (overlayVisible && !g_editMode) {
-                if (msg.message == WM_LBUTTONDOWN && (GetKeyState(VK_MENU) & 0x8000)) { dragging = true; GetCursorPos(&last); }
-                else if (msg.message == WM_LBUTTONUP) { dragging = false; }
-                else if (msg.message == WM_MOUSEMOVE && dragging) {
-                    POINT p; GetCursorPos(&p); RECT r; GetWindowRect(h, &r);
-                    SetWindowPos(h, HWND_TOPMOST, r.left + (p.x - last.x), r.top + (p.y - last.y), 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE); last = p;
-                }
-            }
             TranslateMessage(&msg); DispatchMessageW(&msg);
         }
 
@@ -392,14 +392,54 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         // Read energies
         float EL[NB], ER[NB]; for (int b = 0; b < NB; ++b) { EL[b] = gEL[b].load(std::memory_order_relaxed); ER[b] = gER[b].load(std::memory_order_relaxed); }
 
-        // Pinna (rear/top hints)
+        /* ---- Per-band pinna cues (front/back + elevation) ---- */
         auto L1p = [](float v) { return std::log1p(std::max(0.f, v)); };
-        float E58L = EL[3], E58R = ER[3], E812L = EL[4], E812R = ER[4], E25L = EL[2], E25R = ER[2];
-        float elevScore = std::clamp(0.5f * ((L1p(E812L) - L1p(E58L)) + (L1p(E812R) - L1p(E58R))), -1.f, 1.f);
-        float notch = 0.5f * ((L1p(E58L) - 0.5f * (L1p(E25L) + L1p(E812L))) + (L1p(E58R) - 0.5f * (L1p(E25R) + L1p(E812R))));
-        float backScore = std::clamp(notch, 0.f, 1.f);
 
-        // Clear old peaks a bit (will merge below)
+        // weights: emphasize 5–8k and 8–12k slightly
+        const float Ww[NB] = { 0.0f, 0.2f, 0.6f, 1.0f, 0.9f, 0.2f };
+
+        float elevInst = 0.f;   // scene elevation score (top +, bottom -)
+        float frontInst = 0.f;  // scene front confidence
+        float backInst = 0.f;  // scene rear confidence
+
+        for (int b = 0; b < NB; ++b) {
+            // Pull neighbors for pinna bands
+            float e25L = EL[2], e25R = ER[2];
+            float e58L = EL[3], e58R = ER[3];
+            float e812L = EL[4], e812R = ER[4];
+
+            float L25 = L1p(e25L), R25 = L1p(e25R);
+            float L58 = L1p(e58L), R58 = L1p(e58R);
+            float L812 = L1p(e812L), R812 = L1p(e812R);
+
+            // Elevation per band weight
+            float elevB = std::clamp(0.5f * ((R812 - R58) + (L812 - L58)), -1.f, 1.f);
+
+            // Front/back notch (rear if 5–8k dips vs neighbors)
+            float notchL = L58 - 0.5f * (L25 + L812);
+            float notchR = R58 - 0.5f * (R25 + R812);
+            float rearB = std::clamp(0.5f * (notchL + notchR), 0.f, 1.f);
+            float frontB = std::clamp(1.f - rearB, 0.f, 1.f);
+
+            // Smooth per-band to avoid flicker
+            gBackB[b] = ema(gBackB[b], rearB, 0.18f);
+            gFrontB[b] = ema(gFrontB[b], frontB, 0.18f);
+
+            elevInst += Ww[b] * elevB;
+            backInst += Ww[b] * gBackB[b];
+            frontInst += Ww[b] * gFrontB[b];
+        }
+
+        // Scene-level smoothed elevation (used for sphere brightness shaping)
+        float elevScore = std::clamp(ema(gElevS, elevInst / std::max(1e-6f, (Ww[2] + Ww[3] + Ww[4])), 0.12f), -1.f, 1.f);
+        gElevS = elevScore;
+
+        // Scene-level back/front (not strictly needed for peaks now, but kept for future)
+        float backScore = std::clamp(backInst / std::max(1e-6f, (Ww[2] + Ww[3] + Ww[4])), 0.f, 1.f);
+        float frontScore = std::clamp(frontInst / std::max(1e-6f, (Ww[2] + Ww[3] + Ww[4])), 0.f, 1.f);
+        (void)frontScore; // reserved
+
+        // Decay/clear old peaks
         for (auto& p : g_peaks) if (p.life > 0.f) {
             p.life -= dt;
             p.amp *= std::exp(-dt * PEAK_DECAY_HZ);
@@ -408,30 +448,34 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
 
         const float maxAng = MAX_AZIMUTH_DEG * PI_F / 180.f;
 
-        // Build peaks: for each band, emit Left, Center, Right
+        // Build peaks: per band Left, Front (center), Right; mirror per-band when rear confidence is high
         for (int b = 0; b < NB; ++b) {
             float L = EL[b], R = ER[b];
             float S = L + R;
             if (S <= 1e-6f) continue;
 
-            // ILD: right-positive in our azimuth convention (0=front, +right, -left)
+            // ILD (right-positive)
             float ild = (SWAP_LR ? (L - R) : (R - L)) / S;  // -1..+1
             ild = std::clamp(ild, -1.f, 1.f);
 
             // Components
-            float center = std::min(L, R);          // shared = front
-            float left = std::max(0.f, L - R);    // unique left
-            float right = std::max(0.f, R - L);    // unique right
+            float center = std::min(L, R);               // shared = front
+            float left = std::max(0.f, L - R);         // unique left
+            float right = std::max(0.f, R - L);         // unique right
 
             auto norm = [](float v) { return std::tanh(1.2f * v); }; // soft knee
-            const float maxAng = MAX_AZIMUTH_DEG * PI_F / 180.f;
 
             // -------- Front (12 o’clock) from mono/shared energy --------
             {
                 float a = norm(center);
                 if (a > 0.01f) {
+                    // Optionally damp pure-front if scene is very rear-dominant
+                    float rearDominance = std::clamp(backScore - frontScore, 0.f, 1.f);
+                    float frontDampen = 1.0f - 0.25f * rearDominance;
+                    a *= frontDampen;
+
                     Peak q; q.ang = 0.f; q.amp = a; q.life = 0.50f; q.band = b;
-                    q.rearGain = backScore;
+                    q.rearGain = gBackB[b];
                     q.elevFactor = 1.0f + elevScore * ELEV_SCALE; // sphere brightness only
                     add_peak_merge(q);
                 }
@@ -441,11 +485,10 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
             {
                 float a = norm(left);
                 if (a > 0.01f) {
-                    // bias inside left arc; more unique-left -> closer to -maxAng
                     float frac = (L > 0.f ? left / std::max(L, 1e-6f) : 0.f); // 0..1
                     float ang = -maxAng * std::clamp(0.35f + 0.65f * frac, 0.0f, 1.0f);
                     Peak q; q.ang = ang; q.amp = a; q.life = 0.55f; q.band = b;
-                    q.rearGain = backScore;
+                    q.rearGain = gBackB[b];
                     q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
                     add_peak_merge(q);
                 }
@@ -458,15 +501,16 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
                     float frac = (R > 0.f ? right / std::max(R, 1e-6f) : 0.f);
                     float ang = +maxAng * std::clamp(0.35f + 0.65f * frac, 0.0f, 1.0f);
                     Peak q; q.ang = ang; q.amp = a; q.life = 0.55f; q.band = b;
-                    q.rearGain = backScore;
+                    q.rearGain = gBackB[b];
                     q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
                     add_peak_merge(q);
                 }
             }
 
-            // -------- Rear mirrors (only if pinna suggests “rear”) --------
-            if (backScore > 0.12f) {
-                const float rearScale = std::clamp(backScore, 0.12f, 1.0f); // how strong the rear is
+            // -------- Rear mirrors (PER-BAND using gBackB[b]) --------
+            float backB = gBackB[b];
+            if (backB > 0.10f) {
+                const float rearScale = std::clamp(backB, 0.10f, 1.0f);
 
                 // Mirror FRONT
                 {
@@ -474,7 +518,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
                     if (a > 0.01f) {
                         Peak q; q.ang = std::remainder(0.f + PI_F, 2 * PI_F);
                         q.amp = a; q.life = 0.45f; q.band = b;
-                        q.rearGain = backScore;
+                        q.rearGain = backB;
                         q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
                         add_peak_merge(q);
                     }
@@ -487,7 +531,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
                     if (a > 0.01f) {
                         Peak q; q.ang = std::remainder(angL + PI_F, 2 * PI_F);
                         q.amp = a; q.life = 0.45f; q.band = b;
-                        q.rearGain = backScore;
+                        q.rearGain = backB;
                         q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
                         add_peak_merge(q);
                     }
@@ -500,7 +544,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
                     if (a > 0.01f) {
                         Peak q; q.ang = std::remainder(angR + PI_F, 2 * PI_F);
                         q.amp = a; q.life = 0.45f; q.band = b;
-                        q.rearGain = backScore;
+                        q.rearGain = backB;
                         q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
                         add_peak_merge(q);
                     }
