@@ -1,18 +1,16 @@
-﻿// DeafOverlay.cpp — Fullscreen spatial overlay with settings & per-band controls
-// - Fullscreen layered window
-// - Normal mode: click-through, sphere+ring only
-// - Alt+H: toggle overlay visibility
+﻿// DeafOverlay.cpp — Fullscreen spatial overlay with settings, per-band controls, and info tooltips
+// - Alt+H: toggle overlay
 // - Alt+I: settings mode
-//     * Dark transparent fullscreen background (blocks clicks to game)
-//     * Movable settings panel
-//     * Sphere size slider
-//     * Ring vertical position slider
-//     * Global sensitivity slider
-//     * 6-band frequency sliders: Bass, Low-Mid, Mid, High-Mid, Treble, Air
-//     * Swap L/R checkbox
-//     * Sphere draggable to preferred position (saved normalized)
+//   * Fullscreen dark background (captures clicks)
+//   * Movable settings panel
+//   * Sphere: size slider + drag to position
+//   * Ring: vertical offset slider
+//   * Global sensitivity slider
+//   * 6-band EQ-style sliders (Bass..Air)
+//   * Swap L/R
+//   * Info ("i") buttons explaining each control for deaf / hard of hearing users
+// - Normal mode: click-through, transparent, spatial visual only
 // - Uses WASAPI loopback via miniaudio
-// - Spatial logic from previous checkpoint: multi-peaks, rear hints, elevation hints
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -41,24 +39,18 @@ static constexpr float REAR_SCALE = 1.00f;
 
 /* ===== Runtime user settings ===== */
 static float gSphereScale = 1.0f;   // slider: 0.6 .. 1.6
-static float gRingOffsetY = 0.66f;  // slider: 0.40 .. 0.90 (fraction of screen height)
+static float gRingOffsetY = 0.66f;  // slider: 0.40 .. 0.90 (screen fraction)
 static float gSensitivity = 1.0f;   // slider: 0.5 .. 2.0
-static bool  gSwapLR = false;  // Swap L/R channels for direction
-static bool  gSettingsOpen = false; // Alt+I
+static bool  gSwapLR = false;  // swap channels
+static bool  gSettingsOpen = false;  // Alt+I
 
-// Sphere position in normalized screen coords (0..1)
+// Sphere position (normalized 0..1)
 static float gSpherePosX = 0.5f;
 static float gSpherePosY = 0.47f;
 
-// Per-band gain (user adjustable via sliders), NB=6
-// Bands (rough):
-// 0: Bass (0–250Hz)
-// 1: Low-Mid (250–2k)
-// 2: Mid (2k–5k)
-// 3: High-Mid (5k–8k)
-// 4: Treble (8k–12k)
-// 5: Air (>12k)
+/* ===== Frequency bands ===== */
 static constexpr int NB = 6;
+// Per-band user gains (set via sliders)
 static float gBandGain[NB] = { 1.f,1.f,1.f,1.f,1.f,1.f };
 
 /* ===== Settings panel state ===== */
@@ -71,13 +63,48 @@ static bool gDraggingPanel = false;
 static int  gPanelDragOffX = 0;
 static int  gPanelDragOffY = 0;
 
-// Active slider index:
-// 0 = sphere size, 1 = ring Y, 2 = sensitivity,
-// 3..8 = band 0..5 (Bass..Air)
+// Active slider index during drag
+// 0 sphere, 1 ringY, 2 sens, 3..8 bands 0..5
 static int gActiveSlider = -1;
 
-// Sphere drag (in settings mode)
+// Sphere drag in settings mode
 static bool gDraggingSphere = false;
+
+/* ===== Info button support ===== */
+struct InfoRegion {
+    int x0, y0, x1, y1;
+    const wchar_t* text;
+};
+static InfoRegion gInfoRegions[32];
+static int gInfoCount = 0;
+
+// Explanations (short, game-focused)
+static const wchar_t* kInfoSphereSize =
+L"Sphere size:\nAdjust how large the 3D cue appears.\nSmaller = subtle, larger = easier to see peripheral threats.";
+
+static const wchar_t* kInfoRingY =
+L"Ring vertical position:\nMove the horizontal ring up/down.\nPlace it where your crosshair or focus area is for faster reading.";
+
+static const wchar_t* kInfoSensitivity =
+L"Global sensitivity:\nControls how strongly all sounds light up.\nLower = only louder / closer sounds.\nHigher = includes quiet cues like footsteps and reloading.";
+
+static const wchar_t* kInfoBass =
+L"Bass (0–250 Hz):\nFootsteps, rumbles, explosions, distant booms.\nIncrease to see low thuds and movement.\nReduce if constant rumbles are too noisy.";
+
+static const wchar_t* kInfoLowMid =
+L"Low-Mid (250–2 kHz):\nBody of gunshots, doors, movement, voices.\nGood for tracking players moving nearby.";
+
+static const wchar_t* kInfoMid =
+L"Mid (2–5 kHz):\nClarity of gunshots, glass, impacts, many voice details.\nImportant for precise combat cues.";
+
+static const wchar_t* kInfoHighMid =
+L"High-Mid (5–8 kHz):\nSharp details: headshots, metallic pings, shell drops.\nHelps separate close threats from background.";
+
+static const wchar_t* kInfoAir =
+L"Treble / Air (8 kHz+):\nVery high details: air, hiss, sparks, UI beeps.\nTurn up to catch subtle directional details, down if it's too busy.";
+
+static const wchar_t* kInfoSwapLR =
+L"Swap L/R:\nFlip left and right.\nUse if your headset or game output feels reversed.";
 
 /* ===== Audio (miniaudio) ===== */
 #define MINIAUDIO_IMPLEMENTATION
@@ -103,7 +130,6 @@ static DIB make_dib(int w, int h) {
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
-
     HDC s = GetDC(nullptr);
     d.dc = CreateCompatibleDC(s);
     d.bmp = CreateDIBSection(d.dc, &bmi, DIB_RGB_COLORS, &d.bits, nullptr, 0);
@@ -118,8 +144,8 @@ static void free_dib(DIB& d) {
 }
 
 // Premultiplied alpha pixel
-static inline void putpx_PM(void* bits, int w, int h, int x, int y,
-    BYTE a, BYTE r, BYTE g, BYTE b)
+static inline void putpx_PM(void* bits, int w, int h,
+    int x, int y, BYTE a, BYTE r, BYTE g, BYTE b)
 {
     if ((unsigned)x >= (unsigned)w || (unsigned)y >= (unsigned)h) return;
     BYTE* p = (BYTE*)bits + ((size_t)y * w + x) * 4;
@@ -140,12 +166,37 @@ static void blit_layered(HWND hWnd, HDC src, int w, int h) {
     UpdateLayeredWindow(hWnd, nullptr, &pos, &sz, src, &srcpt, 0, &bf, ULW_ALPHA);
 }
 
+/* ===== Info icon helpers ===== */
+
+static void add_info_region(int cx, int cy, const wchar_t* text) {
+    if (gInfoCount >= (int)(sizeof(gInfoRegions) / sizeof(gInfoRegions[0]))) return;
+    int r = 7;
+    gInfoRegions[gInfoCount++] = { cx - r, cy - r, cx + r, cy + r, text };
+}
+
+static void draw_info_icon(void* bits, int w, int h, int cx, int cy) {
+    int r = 6;
+    // Circle
+    for (int dy = -r; dy <= r; ++dy) {
+        for (int dx = -r; dx <= r; ++dx) {
+            if (dx * dx + dy * dy <= r * r) {
+                BYTE a = 220;
+                putpx_PM(bits, w, h, cx + dx, cy + dy, a, 40, 40, 60);
+            }
+        }
+    }
+    // "i"
+    putpx_PM(bits, w, h, cx, cy - 2, 255, 255, 255, 255);
+    for (int yy = -1; yy <= 2; ++yy)
+        putpx_PM(bits, w, h, cx, cy + yy, 255, 255, 255, 255);
+}
+
 /* ===== Band energies (atomic from callback) ===== */
 static std::atomic<float> gEL[NB], gER[NB];
 
 static inline float lp_step(float y, float x, float a) { return y + a * (x - y); }
 
-/* ===== Peaks / pinna helpers ===== */
+/* ===== Peaks / elevation ===== */
 constexpr float PI_F = 3.14159265358979323846f;
 static float gBackB[NB] = { 0 };
 static float gFrontB[NB] = { 0 };
@@ -153,14 +204,14 @@ static float gElevS = 0.f;
 static inline float ema(float prev, float x, float a) { return prev + a * (x - prev); }
 
 struct Peak {
-    float ang = 0.f;    // 0=front (12 o'clock), +right, -left
-    float amp = 0.f;    // 0..1
-    float life = 0.f;   // seconds
+    float ang = 0.f;
+    float amp = 0.f;
+    float life = 0.f;
     int   band = 0;
     float rearGain = 0.f;
     float elevFactor = 1.f;
 };
-static Peak g_peaks[18];  // up to 3 per band
+static Peak g_peaks[18];
 
 static inline void level_to_color(float s, BYTE& r, BYTE& g, BYTE& b) {
     r = 255;
@@ -205,8 +256,11 @@ void MA_API audio_cb(ma_device* dev, void*, const void* pIn, ma_uint32 frames) {
     const ma_uint32 ch = dev->capture.channels ? dev->capture.channels : 1;
 
     auto a_fc = [&](float fc) { return 1.0f - std::exp(-6.2831853f * fc / (float)dev->sampleRate); };
-    const float a250 = a_fc(250.f), a2k = a_fc(2000.f), a5k = a_fc(5000.f),
-        a8k = a_fc(8000.f), a12k = a_fc(12000.f);
+    const float a250 = a_fc(250.f),
+        a2k = a_fc(2000.f),
+        a5k = a_fc(5000.f),
+        a8k = a_fc(8000.f),
+        a12k = a_fc(12000.f);
     const float aTot = 0.07f;
 
     float lp250L = 0, lp2kL = 0, lp5kL = 0, lp8kL = 0, lp12kL = 0, totL = 0;
@@ -249,15 +303,15 @@ void MA_API audio_cb(ma_device* dev, void*, const void* pIn, ma_uint32 frames) {
     bR[4] = std::max(0.f, lp12kR - lp8kR);
     bR[5] = std::max(0.f, totR - lp12kR);
 
-    // Global and per-band gains
+    // Global & per-band gain
     float g = 1.8f * BASE_SENS_GAIN * gSensitivity;
 
-    // Slight built-in lift for quiet lows/mids (before user EQ)
+    // Subtle built-in emphasis for lows/mids
     bL[0] *= 1.25f; bR[0] *= 1.25f;
     bL[1] *= 1.10f; bR[1] *= 1.10f;
 
     for (int k = 0; k < NB; ++k) {
-        float bandGain = std::clamp(gBandGain[k], 0.0f, 3.0f); // user EQ
+        float bandGain = std::clamp(gBandGain[k], 0.0f, 3.0f);
         float eL = g * bandGain * bL[k];
         float eR = g * bandGain * bR[k];
 
@@ -455,38 +509,25 @@ static void slider_apply(int idx, float t) {
     }
     else if (idx >= 3 && idx < 3 + NB) {
         int b = idx - 3;
-        // Map:
-        // t=0   -> gain=0.0 (mute that band)
-        // t=0.5 -> gain=1.0 (neutral)
-        // t=1.0 -> gain=3.0 (boost)
-        if (t <= 0.5f) {
-            gBandGain[b] = (t / 0.5f) * 1.0f;                // 0..1
-        }
-        else {
+        if (t <= 0.5f)
+            gBandGain[b] = (t / 0.5f) * 1.0f;             // 0..1
+        else
             gBandGain[b] = 1.0f + ((t - 0.5f) / 0.5f) * 2.0f; // 1..3
-        }
     }
 }
 
 static float slider_t_from_value(int idx) {
-    if (idx == 0) {
+    if (idx == 0)
         return std::clamp((gSphereScale - 0.6f) / (1.6f - 0.6f), 0.0f, 1.0f);
-    }
-    else if (idx == 1) {
+    if (idx == 1)
         return std::clamp((gRingOffsetY - 0.40f) / (0.90f - 0.40f), 0.0f, 1.0f);
-    }
-    else if (idx == 2) {
+    if (idx == 2)
         return std::clamp((gSensitivity - 0.5f) / (2.0f - 0.5f), 0.0f, 1.0f);
-    }
-    else if (idx >= 3 && idx < 3 + NB) {
+    if (idx >= 3 && idx < 3 + NB) {
         int b = idx - 3;
         float g = std::clamp(gBandGain[b], 0.0f, 3.0f);
-        if (g <= 1.0f) {
-            return 0.5f * (g / 1.0f);                          // 0..0.5
-        }
-        else {
-            return 0.5f + 0.5f * ((g - 1.0f) / 2.0f);          // 0.5..1.0
-        }
+        if (g <= 1.0f) return 0.5f * (g / 1.0f);
+        return 0.5f + 0.5f * ((g - 1.0f) / 2.0f);
     }
     return 0.0f;
 }
@@ -494,11 +535,9 @@ static float slider_t_from_value(int idx) {
 static void draw_slider_bar(void* bits, int w, int h,
     int x0, int y, int x1, float t)
 {
-    // Track
     for (int x = x0; x <= x1; ++x)
         putpx_PM(bits, w, h, x, y, 90, 220, 220, 220);
 
-    // Knob
     int knobX = x0 + int(t * float(x1 - x0));
     for (int dy = -4; dy <= 4; ++dy)
         for (int dx = -3; dx <= 3; ++dx)
@@ -513,7 +552,9 @@ static void draw_settings_panel() {
     int w = g_dib.w, h = g_dib.h;
     void* bits = g_dib.bits;
 
-    // Clamp panel on-screen
+    gInfoCount = 0; // rebuild info hit regions
+
+    // Clamp panel
     if (gPanelX < 10) gPanelX = 10;
     if (gPanelY < 10) gPanelY = 10;
     if (gPanelX + PANEL_W > w - 10) gPanelX = w - 10 - PANEL_W;
@@ -524,7 +565,7 @@ static void draw_settings_panel() {
     int x1 = x0 + PANEL_W;
     int y1 = y0 + PANEL_H;
 
-    // Panel background
+    // Background
     for (int y = y0; y < y1; ++y)
         for (int x = x0; x < x1; ++x)
             putpx_PM(bits, w, h, x, y, 200, 16, 16, 20);
@@ -534,9 +575,8 @@ static void draw_settings_panel() {
         for (int x = x0; x < x1; ++x)
             putpx_PM(bits, w, h, x, y, 230, 32, 32, 40);
 
-    // Layout
     int innerX0 = x0 + 12;
-    int innerX1 = x1 - 12;
+    int innerX1 = x1 - 28; // leave room for info icons on the right
     int row = y0 + 40;
     int dy = 26;
 
@@ -559,7 +599,7 @@ static void draw_settings_panel() {
     draw_slider_bar(bits, w, h, innerX0, yHigh, innerX1, slider_t_from_value(6));
     draw_slider_bar(bits, w, h, innerX0, yAir, innerX1, slider_t_from_value(7));
 
-    // Text labels via GDI
+    // Text labels with info icons
     HDC dc = g_dib.dc;
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, RGB(255, 255, 255));
@@ -568,15 +608,22 @@ static void draw_settings_panel() {
 
     TextOutW(dc, x0 + 10, y0 + 5, L"DeafOverlay Settings", 21);
 
-    TextOutW(dc, innerX0, ySphere - 14, L"Sphere size", 11);
-    TextOutW(dc, innerX0, yRing - 14, L"Ring vertical position", 23);
-    TextOutW(dc, innerX0, ySens - 14, L"Global sensitivity", 18);
+    auto label_with_info = [&](int y, const wchar_t* txt, const wchar_t* info) {
+        TextOutW(dc, innerX0, y - 14, txt, (int)wcslen(txt));
+        int ix = x1 - 14;
+        int iy = y - 10;
+        draw_info_icon(bits, w, h, ix, iy);
+        add_info_region(ix, iy, info);
+        };
 
-    TextOutW(dc, innerX0, yBass - 14, L"Bass (0-250 Hz)", 15);
-    TextOutW(dc, innerX0, yLowMid - 14, L"Low-Mid (250-2k)", 17);
-    TextOutW(dc, innerX0, yMid - 14, L"Mid (2-5k)", 11);
-    TextOutW(dc, innerX0, yHigh - 14, L"High-Mid (5-8k)", 17);
-    TextOutW(dc, innerX0, yAir - 14, L"Treble / Air (8k+)", 19);
+    label_with_info(ySphere, L"Sphere size", kInfoSphereSize);
+    label_with_info(yRing, L"Ring vertical position", kInfoRingY);
+    label_with_info(ySens, L"Global sensitivity", kInfoSensitivity);
+    label_with_info(yBass, L"Bass (0-250 Hz)", kInfoBass);
+    label_with_info(yLowMid, L"Low-Mid (250-2k)", kInfoLowMid);
+    label_with_info(yMid, L"Mid (2-5k)", kInfoMid);
+    label_with_info(yHigh, L"High-Mid (5-8k)", kInfoHighMid);
+    label_with_info(yAir, L"Treble / Air (8k+)", kInfoAir);
 
     // Swap L/R checkbox
     int cbX = innerX0;
@@ -597,6 +644,12 @@ static void draw_settings_panel() {
     }
     TextOutW(dc, cbX + cbS + 6, cbY - 1, L"Swap L/R", 8);
 
+    // Info icon for Swap L/R
+    int swapInfoX = x1 - 14;
+    int swapInfoY = cbY + 2;
+    draw_info_icon(bits, w, h, swapInfoX, swapInfoY);
+    add_info_region(swapInfoX, swapInfoY, kInfoSwapLR);
+
     SelectObject(dc, oldF);
 }
 
@@ -609,10 +662,10 @@ static void set_settings_mode(HWND h, bool on) {
     gSettingsOpen = on;
     LONG ex = GetWindowLongW(h, GWL_EXSTYLE);
     if (on) {
-        ex &= ~WS_EX_TRANSPARENT; // capture clicks
+        ex &= ~WS_EX_TRANSPARENT;  // capture clicks
     }
     else {
-        ex |= WS_EX_TRANSPARENT; // click-through
+        ex |= WS_EX_TRANSPARENT;   // click-through
         gActiveSlider = -1;
         gDraggingPanel = false;
         gDraggingSphere = false;
@@ -634,7 +687,7 @@ static void render_frame() {
     void* bits = g_dib.bits;
 
     if (gSettingsOpen) {
-        // Dark translucent fullscreen background
+        // Dark fullscreen mask
         for (int y = 0; y < h; ++y)
             for (int x = 0; x < w; ++x)
                 putpx_PM(bits, w, h, x, y, 160, 0, 0, 0);
@@ -643,15 +696,14 @@ static void render_frame() {
         std::memset(bits, 0, (size_t)w * (size_t)h * 4);
     }
 
-    // Sphere position and size (small base to match original look)
     float cx = gSpherePosX * w;
     float cy = gSpherePosY * h;
-    float baseScale = 0.13f; // tuned to match old ~420px overlay
+
+    float baseScale = 0.13f; // matches our 420px baseline feel
     float sphereR = std::min(w, h) * baseScale * gSphereScale;
 
     draw_sphere(bits, w, h, cx, cy, sphereR, 22.f);
 
-    // Ring aligned horizontally with sphere; vertical via slider
     float rx = std::min(w, h) * (baseScale * 1.1f) * gSphereScale;
     float ry = rx * 0.45f;
     float ringY = gRingOffsetY * h;
@@ -668,12 +720,9 @@ static void render_frame() {
 LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
     switch (m) {
     case WM_NCHITTEST:
-        if (!gSettingsOpen) {
-            // Normal mode: full click-through
-            return HTTRANSPARENT;
-        }
-        // In settings: everything is client; we'll handle hit logic manually
-        return HTCLIENT;
+        if (!gSettingsOpen)
+            return HTTRANSPARENT; // full click-through in normal mode
+        return HTCLIENT;          // settings mode: handle manually
 
     case WM_LBUTTONDOWN:
         if (gSettingsOpen) {
@@ -683,11 +732,24 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
             int w = g_dib.w;
             int hh = g_dib.h;
 
-            // Recompute layout to match draw_settings_panel
+            // 0) Info icons: if clicked, show description
+            for (int i = 0; i < gInfoCount; ++i) {
+                const auto& inf = gInfoRegions[i];
+                if (mx >= inf.x0 && mx <= inf.x1 &&
+                    my >= inf.y0 && my <= inf.y1) {
+                    MessageBoxW(h, inf.text, L"Overlay Setting Info",
+                        MB_OK | MB_ICONINFORMATION);
+                    ReleaseCapture();
+                    return 0;
+                }
+            }
+
+            // Reconstruct panel geometry (must match draw_settings_panel)
             int innerX0 = gPanelX + 12;
-            int innerX1 = gPanelX + PANEL_W - 12;
+            int innerX1 = gPanelX + PANEL_W - 28;
             int row = gPanelY + 40;
             int dy = 26;
+
             int ySphere = row;          row += dy;
             int yRing = row;          row += dy;
             int ySens = row;          row += dy;
@@ -703,7 +765,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
                     my >= sy - halfH && my <= sy + halfH);
                 };
 
-            // 1) Panel drag (title bar)
+            // 1) Panel drag via title bar
             int px0 = gPanelX;
             int py0 = gPanelY;
             int px1 = px0 + PANEL_W;
@@ -720,69 +782,63 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
             // 2) Sliders
             if (inSlider(ySphere)) {
                 gActiveSlider = 0;
-                float t = (float)(mx - innerX0) / (float)(innerX1 - innerX0);
-                slider_apply(0, t);
+                slider_apply(0, (float)(mx - innerX0) / (float)(innerX1 - innerX0));
                 return 0;
             }
             if (inSlider(yRing)) {
                 gActiveSlider = 1;
-                float t = (float)(mx - innerX0) / (float)(innerX1 - innerX0);
-                slider_apply(1, t);
+                slider_apply(1, (float)(mx - innerX0) / (float)(innerX1 - innerX0));
                 return 0;
             }
             if (inSlider(ySens)) {
                 gActiveSlider = 2;
-                float t = (float)(mx - innerX0) / (float)(innerX1 - innerX0);
-                slider_apply(2, t);
+                slider_apply(2, (float)(mx - innerX0) / (float)(innerX1 - innerX0));
                 return 0;
             }
             if (inSlider(yBass)) {
                 gActiveSlider = 3;
-                float t = (float)(mx - innerX0) / (float)(innerX1 - innerX0);
-                slider_apply(3, t);
+                slider_apply(3, (float)(mx - innerX0) / (float)(innerX1 - innerX0));
                 return 0;
             }
             if (inSlider(yLowMid)) {
                 gActiveSlider = 4;
-                float t = (float)(mx - innerX0) / (float)(innerX1 - innerX0);
-                slider_apply(4, t);
+                slider_apply(4, (float)(mx - innerX0) / (float)(innerX1 - innerX0));
                 return 0;
             }
             if (inSlider(yMid)) {
                 gActiveSlider = 5;
-                float t = (float)(mx - innerX0) / (float)(innerX1 - innerX0);
-                slider_apply(5, t);
+                slider_apply(5, (float)(mx - innerX0) / (float)(innerX1 - innerX0));
                 return 0;
             }
             if (inSlider(yHigh)) {
                 gActiveSlider = 6;
-                float t = (float)(mx - innerX0) / (float)(innerX1 - innerX0);
-                slider_apply(6, t);
+                slider_apply(6, (float)(mx - innerX0) / (float)(innerX1 - innerX0));
                 return 0;
             }
             if (inSlider(yAir)) {
                 gActiveSlider = 7;
-                float t = (float)(mx - innerX0) / (float)(innerX1 - innerX0);
-                slider_apply(7, t);
+                slider_apply(7, (float)(mx - innerX0) / (float)(innerX1 - innerX0));
                 return 0;
             }
 
-            // 3) Swap L/R checkbox region
-            int cbX = innerX0;
-            int cbY = yAir + 10;
-            int cbS = 12;
-            if (mx >= cbX && mx <= cbX + cbS + 70 &&
-                my >= cbY - 4 && my <= cbY + cbS + 4)
+            // 3) Swap L/R toggle
             {
-                gSwapLR = !gSwapLR;
-                gActiveSlider = -1;
-                gDraggingPanel = false;
-                gDraggingSphere = false;
-                ReleaseCapture();
-                return 0;
+                int cbX = innerX0;
+                int cbY = yAir + 10;
+                int cbS = 12;
+                if (mx >= cbX && mx <= cbX + cbS + 70 &&
+                    my >= cbY - 4 && my <= cbY + cbS + 4)
+                {
+                    gSwapLR = !gSwapLR;
+                    gActiveSlider = -1;
+                    gDraggingPanel = false;
+                    gDraggingSphere = false;
+                    ReleaseCapture();
+                    return 0;
+                }
             }
 
-            // 4) Sphere drag (click near current sphere)
+            // 4) Sphere drag (inside sphere radius)
             {
                 float cx = gSpherePosX * w;
                 float cy = gSpherePosY * hh;
@@ -798,7 +854,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
                 }
             }
 
-            // Otherwise: click on dark background; no-op
+            // Click on dim background: no-op
             return 0;
         }
         break;
@@ -809,9 +865,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
             int my = GET_Y_LPARAM(lParam);
             int w = g_dib.w;
             int hh = g_dib.h;
-
             int innerX0 = gPanelX + 12;
-            int innerX1 = gPanelX + PANEL_W - 12;
+            int innerX1 = gPanelX + PANEL_W - 28;
 
             if (gDraggingPanel) {
                 gPanelX = mx - gPanelDragOffX;
@@ -871,7 +926,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         setCtx((HANDLE)-4); // PER_MONITOR_AWARE_V2
     }
 
-    // Window class
+    // Class
     WNDCLASSW wc{};
     wc.hInstance = inst;
     wc.lpfnWndProc = WndProc;
@@ -946,27 +1001,23 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
             DispatchMessageW(&msg);
         }
 
-        // Time step
         float t = std::chrono::duration<float>(
             std::chrono::steady_clock::now() - t0).count();
         float dt = t - tPrev;
         tPrev = t;
 
-        // Pull band energies
+        // Read energies
         float EL[NB], ER[NB];
         for (int b = 0; b < NB; ++b) {
             EL[b] = gEL[b].load(std::memory_order_relaxed);
             ER[b] = gER[b].load(std::memory_order_relaxed);
         }
 
-        // Pinna / elevation / front/back scoring
+        // Pinna / elevation / rear estimate (same idea as before)
         auto L1p = [](float v) { return std::log1p(std::max(0.f, v)); };
         const float Ww[NB] = { 0.0f, 0.2f, 0.6f, 1.0f, 0.9f, 0.2f };
 
-        float elevInst = 0.f;
-        float backInst = 0.f;
-        float frontInst = 0.f;
-
+        float elevInst = 0.f, backInst = 0.f, frontInst = 0.f;
         for (int b = 0; b < NB; ++b) {
             float e25L = EL[2], e25R = ER[2];
             float e58L = EL[3], e58R = ER[3];
@@ -1005,14 +1056,14 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
 
         const float maxAng = MAX_AZIMUTH_DEG * PI_F / 180.f;
 
-        // Build peaks: for each band, Left / Center / Right + rear mirrors
+        // Build peaks from band energies
         for (int b = 0; b < NB; ++b) {
             float L = EL[b];
             float R = ER[b];
             float S = L + R;
             if (S <= 1e-6f) continue;
 
-            float ild = (gSwapLR ? (L - R) : (R - L)) / S; // right-positive
+            float ild = (gSwapLR ? (L - R) : (R - L)) / S; // + = right
             ild = std::clamp(ild, -1.f, 1.f);
 
             float center = std::min(L, R);
@@ -1021,7 +1072,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
 
             auto norm = [](float v) { return std::tanh(1.2f * v); };
 
-            // Front/mono
+            // Front: shared energy, but damped if strong rear cue
             {
                 float a = norm(center);
                 if (a > 0.01f) {
@@ -1037,7 +1088,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
                     add_peak_merge(q);
                 }
             }
-            // Left
+            // Left continuous
             {
                 float a = norm(left);
                 if (a > 0.01f) {
@@ -1053,7 +1104,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
                     add_peak_merge(q);
                 }
             }
-            // Right
+            // Right continuous
             {
                 float a = norm(right);
                 if (a > 0.01f) {
@@ -1070,7 +1121,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
                 }
             }
 
-            // Rear mirrors
+            // Rear mirrors when pinna says "back"
             float backB = gBackB[b];
             if (backB > 0.10f) {
                 float rearScale = std::clamp(backB, 0.10f, 1.0f);
