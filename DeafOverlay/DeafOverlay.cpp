@@ -1,4 +1,4 @@
-﻿// DeafOverlay.cpp — Fullscreen spatial overlay with settings, per-band controls, and info tooltips
+﻿// DeafOverlay.cpp — Fullscreen spatial overlay with settings, per-band controls, info tooltips, and game presets
 // - Alt+H: toggle overlay
 // - Alt+I: settings mode
 //   * Fullscreen dark background (captures clicks)
@@ -8,7 +8,9 @@
 //   * Global sensitivity slider
 //   * 6-band EQ-style sliders (Bass..Air)
 //   * Swap L/R
+//   * Game preset checkboxes (CS2 / R6 Siege / Call of Duty)
 //   * Info ("i") buttons explaining each control for deaf / hard of hearing users
+// - Static hint box at top-left (always visible): hotkeys reminder
 // - Normal mode: click-through, transparent, spatial visual only
 // - Uses WASAPI loopback via miniaudio
 
@@ -41,8 +43,8 @@ static constexpr float REAR_SCALE = 1.00f;
 static float gSphereScale = 1.0f;   // slider: 0.6 .. 1.6
 static float gRingOffsetY = 0.66f;  // slider: 0.40 .. 0.90 (screen fraction)
 static float gSensitivity = 1.0f;   // slider: 0.5 .. 2.0
-static bool  gSwapLR = false;  // swap channels
-static bool  gSettingsOpen = false;  // Alt+I
+static bool  gSwapLR = false;       // swap channels
+static bool  gSettingsOpen = false; // Alt+I
 
 // Sphere position (normalized 0..1)
 static float gSpherePosX = 0.5f;
@@ -53,9 +55,69 @@ static constexpr int NB = 6;
 // Per-band user gains (set via sliders)
 static float gBandGain[NB] = { 1.f,1.f,1.f,1.f,1.f,1.f };
 
+/* ===== Game presets ===== */
+enum class GamePreset : int {
+    None = 0,
+    CS2,
+    R6S,
+    COD
+};
+static GamePreset gPreset = GamePreset::None;
+
+static void apply_preset(GamePreset p) {
+    gPreset = p;
+
+    // Reasonable “starter” tuning (you can refine with real gameplay tests):
+    // Bands: 0 Bass (0-250), 1 LowMid (250-2k), 2 Mid (2-5k), 3 HighMid (5-8k), 4 Air (8-12k), 5 Ultra/Total (12k+ / residual)
+    if (p == GamePreset::None) {
+        // Do nothing (keep current)
+        return;
+    }
+
+    if (p == GamePreset::CS2) {
+        // CS2: footsteps/utility detail often sits in mids/high-mids; tame bass rumble.
+        gSensitivity = 1.20f;
+        gBandGain[0] = 0.75f; // bass down
+        gBandGain[1] = 1.05f;
+        gBandGain[2] = 1.35f; // mid up
+        gBandGain[3] = 1.45f; // high-mid up
+        gBandGain[4] = 1.20f; // air slightly up
+        gBandGain[5] = 1.00f;
+    }
+    else if (p == GamePreset::R6S) {
+        // R6 Siege: lots of subtle movement + gadget cues; favor low-mid through high-mid, keep bass controlled.
+        gSensitivity = 1.25f;
+        gBandGain[0] = 0.85f;
+        gBandGain[1] = 1.20f;
+        gBandGain[2] = 1.30f;
+        gBandGain[3] = 1.35f;
+        gBandGain[4] = 1.10f;
+        gBandGain[5] = 1.00f;
+    }
+    else if (p == GamePreset::COD) {
+        // Call of Duty: explosions can drown detail; keep bass but boost low-mid/mid to retain footsteps/reload presence.
+        gSensitivity = 1.10f;
+        gBandGain[0] = 1.10f;
+        gBandGain[1] = 1.25f;
+        gBandGain[2] = 1.25f;
+        gBandGain[3] = 1.15f;
+        gBandGain[4] = 0.95f;
+        gBandGain[5] = 1.00f;
+    }
+}
+
+static void set_preset_exclusive(GamePreset p) {
+    if (gPreset == p) {
+        // uncheck -> go None (leave current values as-is)
+        gPreset = GamePreset::None;
+        return;
+    }
+    apply_preset(p);
+}
+
 /* ===== Settings panel state ===== */
-static const int PANEL_W = 320;
-static const int PANEL_H = 310;
+static const int PANEL_W = 360;
+static const int PANEL_H = 420;
 
 static int  gPanelX = 40;
 static int  gPanelY = 40;
@@ -75,36 +137,52 @@ struct InfoRegion {
     int x0, y0, x1, y1;
     const wchar_t* text;
 };
-static InfoRegion gInfoRegions[32];
+static InfoRegion gInfoRegions[48];
 static int gInfoCount = 0;
 
-// Explanations (short, game-focused)
+/* ===== Preset checkbox hit regions ===== */
+struct HitRegion {
+    int x0, y0, x1, y1;
+    int id; // arbitrary
+};
+static HitRegion gHitRegions[32];
+static int gHitCount = 0;
+
+static void add_hit_region(int x0, int y0, int x1, int y1, int id) {
+    if (gHitCount >= (int)(sizeof(gHitRegions) / sizeof(gHitRegions[0]))) return;
+    gHitRegions[gHitCount++] = { x0,y0,x1,y1,id };
+}
+
+/* ===== Explanations (short, game-focused) ===== */
 static const wchar_t* kInfoSphereSize =
 L"Sphere size:\nAdjust how large the 3D cue appears.\nSmaller = subtle, larger = easier to see peripheral threats.";
 
 static const wchar_t* kInfoRingY =
-L"Ring vertical position:\nMove the horizontal ring up/down.\nPlace it where your crosshair or focus area is for faster reading.";
+L"Ring vertical position:\nMove the horizontal ring up/down.\nPlace it near your crosshair/focus area for faster reading.";
 
 static const wchar_t* kInfoSensitivity =
-L"Global sensitivity:\nControls how strongly all sounds light up.\nLower = only louder / closer sounds.\nHigher = includes quiet cues like footsteps and reloading.";
+L"Global sensitivity:\nControls how strongly all sounds light up.\nLower = only louder/closer sounds.\nHigher = includes quiet cues like footsteps and reloads.";
 
 static const wchar_t* kInfoBass =
-L"Bass (0–250 Hz):\nFootsteps, rumbles, explosions, distant booms.\nIncrease to see low thuds and movement.\nReduce if constant rumbles are too noisy.";
+L"Bass (0–250 Hz):\nFootsteps thuds, rumbles, explosions, distant booms.\nIncrease to see low movement.\nReduce if constant rumble is too noisy.";
 
 static const wchar_t* kInfoLowMid =
-L"Low-Mid (250–2 kHz):\nBody of gunshots, doors, movement, voices.\nGood for tracking players moving nearby.";
+L"Low-Mid (250–2 kHz):\nBody of gunshots, doors, movement, voices.\nGood for tracking nearby players.";
 
 static const wchar_t* kInfoMid =
-L"Mid (2–5 kHz):\nClarity of gunshots, glass, impacts, many voice details.\nImportant for precise combat cues.";
+L"Mid (2–5 kHz):\nClarity of gunshots, glass, impacts, voice detail.\nImportant for precise combat cues.";
 
 static const wchar_t* kInfoHighMid =
-L"High-Mid (5–8 kHz):\nSharp details: headshots, metallic pings, shell drops.\nHelps separate close threats from background.";
+L"High-Mid (5–8 kHz):\nSharp details: metallic pings, shell drops, some footsteps.\nHelps separate close threats from background.";
 
 static const wchar_t* kInfoAir =
-L"Treble / Air (8 kHz+):\nVery high details: air, hiss, sparks, UI beeps.\nTurn up to catch subtle directional details, down if it's too busy.";
+L"Treble / Air (8 kHz+):\nVery high details: hiss, sparks, UI beeps.\nTurn up to catch subtle directional cues, down if too busy.";
 
 static const wchar_t* kInfoSwapLR =
 L"Swap L/R:\nFlip left and right.\nUse if your headset or game output feels reversed.";
+
+static const wchar_t* kInfoPreset =
+L"Game presets:\nOne-click tuning for common games.\nThese adjust sensitivity + band gains to make key cues easier to see.\nYou can still fine-tune sliders after selecting.";
 
 /* ===== Audio (miniaudio) ===== */
 #define MINIAUDIO_IMPLEMENTATION
@@ -167,7 +245,6 @@ static void blit_layered(HWND hWnd, HDC src, int w, int h) {
 }
 
 /* ===== Info icon helpers ===== */
-
 static void add_info_region(int cx, int cy, const wchar_t* text) {
     if (gInfoCount >= (int)(sizeof(gInfoRegions) / sizeof(gInfoRegions[0]))) return;
     int r = 7;
@@ -355,7 +432,6 @@ static void audio_shutdown() {
 }
 
 /* ===== Sphere & Ring drawing ===== */
-
 static inline void base_ring_pixel(void* bits, int w, int h, int x, int y, float t) {
     putpx_PM(bits, w, h, x, y, (BYTE)(t * 150), 255, 255, 255);
 }
@@ -381,8 +457,8 @@ static void draw_ring(void* bits, int w, int h, float cx, float cy, float a, flo
                 float dist = std::fabs(std::remainder(ang - p.ang, 2 * PI_F));
                 float hot = std::max(0.f, 1.f - dist / 0.9f);
                 float win = (1.f - std::cosf(hot * PI_F)) * 0.5f;
-                float g = win * p.amp;
-                if (g > bestGlow) { bestGlow = g; bestAmp = p.amp; }
+                float gg = win * p.amp;
+                if (gg > bestGlow) { bestGlow = gg; bestAmp = p.amp; }
             }
 
             if (bestGlow > 0.f) {
@@ -495,7 +571,6 @@ static void draw_sphere(void* bits, int w, int h,
 }
 
 /* ===== Slider helpers ===== */
-
 static void slider_apply(int idx, float t) {
     t = std::clamp(t, 0.0f, 1.0f);
     if (idx == 0) {
@@ -510,7 +585,7 @@ static void slider_apply(int idx, float t) {
     else if (idx >= 3 && idx < 3 + NB) {
         int b = idx - 3;
         if (t <= 0.5f)
-            gBandGain[b] = (t / 0.5f) * 1.0f;             // 0..1
+            gBandGain[b] = (t / 0.5f) * 1.0f;                 // 0..1
         else
             gBandGain[b] = 1.0f + ((t - 0.5f) / 0.5f) * 2.0f; // 1..3
     }
@@ -525,9 +600,9 @@ static float slider_t_from_value(int idx) {
         return std::clamp((gSensitivity - 0.5f) / (2.0f - 0.5f), 0.0f, 1.0f);
     if (idx >= 3 && idx < 3 + NB) {
         int b = idx - 3;
-        float g = std::clamp(gBandGain[b], 0.0f, 3.0f);
-        if (g <= 1.0f) return 0.5f * (g / 1.0f);
-        return 0.5f + 0.5f * ((g - 1.0f) / 2.0f);
+        float gg = std::clamp(gBandGain[b], 0.0f, 3.0f);
+        if (gg <= 1.0f) return 0.5f * (gg / 1.0f);
+        return 0.5f + 0.5f * ((gg - 1.0f) / 2.0f);
     }
     return 0.0f;
 }
@@ -544,8 +619,58 @@ static void draw_slider_bar(void* bits, int w, int h,
             putpx_PM(bits, w, h, knobX + dx, y + dy, 210, 255, 180, 80);
 }
 
-/* ===== Settings panel drawing ===== */
+/* ===== Small UI primitives ===== */
+static void draw_box_outline(void* bits, int w, int h, int x, int y, int s, BYTE a = 220) {
+    for (int yy = 0; yy < s; ++yy)
+        for (int xx = 0; xx < s; ++xx) {
+            bool border = (yy == 0 || yy == s - 1 || xx == 0 || xx == s - 1);
+            putpx_PM(bits, w, h, x + xx, y + yy, border ? a : 40, 255, 255, 255);
+        }
+}
+static void draw_check_mark(void* bits, int w, int h, int x, int y, int s) {
+    // simple X mark
+    for (int i = 2; i < s - 2; ++i) {
+        putpx_PM(bits, w, h, x + i, y + i, 230, 255, 220, 80);
+        putpx_PM(bits, w, h, x + (s - 1 - i), y + i, 230, 255, 220, 80);
+    }
+}
 
+/* ===== Hint box (top-left) ===== */
+static void draw_hint_box() {
+    if (!g_dib.bits) return;
+    int w = g_dib.w, h = g_dib.h;
+    void* bits = g_dib.bits;
+
+    const int x0 = 14;
+    const int y0 = 14;
+    const int bw = 290;
+    const int bh = 54;
+    const int x1 = std::min(w - 14, x0 + bw);
+    const int y1 = std::min(h - 14, y0 + bh);
+
+    // background
+    for (int y = y0; y < y1; ++y)
+        for (int x = x0; x < x1; ++x)
+            putpx_PM(bits, w, h, x, y, 170, 12, 12, 14);
+
+    // top strip
+    for (int y = y0; y < std::min(y1, y0 + 18); ++y)
+        for (int x = x0; x < x1; ++x)
+            putpx_PM(bits, w, h, x, y, 200, 28, 28, 34);
+
+    HDC dc = g_dib.dc;
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));
+    HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    HFONT oldF = (HFONT)SelectObject(dc, hFont);
+
+    TextOutW(dc, x0 + 10, y0 + 2, L"DeafOverlay Hotkeys", 18);
+    TextOutW(dc, x0 + 10, y0 + 22, L"Alt+H: Show/Hide   Alt+I: Settings", 36);
+
+    SelectObject(dc, oldF);
+}
+
+/* ===== Settings panel drawing ===== */
 static void draw_settings_panel() {
     if (!gSettingsOpen || !g_dib.bits) return;
 
@@ -553,6 +678,7 @@ static void draw_settings_panel() {
     void* bits = g_dib.bits;
 
     gInfoCount = 0; // rebuild info hit regions
+    gHitCount = 0;  // rebuild UI hit regions
 
     // Clamp panel
     if (gPanelX < 10) gPanelX = 10;
@@ -568,26 +694,26 @@ static void draw_settings_panel() {
     // Background
     for (int y = y0; y < y1; ++y)
         for (int x = x0; x < x1; ++x)
-            putpx_PM(bits, w, h, x, y, 200, 16, 16, 20);
+            putpx_PM(bits, w, h, x, y, 205, 16, 16, 20);
 
     // Title bar
     for (int y = y0; y < y0 + 24; ++y)
         for (int x = x0; x < x1; ++x)
-            putpx_PM(bits, w, h, x, y, 230, 32, 32, 40);
+            putpx_PM(bits, w, h, x, y, 235, 32, 32, 40);
 
     int innerX0 = x0 + 12;
-    int innerX1 = x1 - 28; // leave room for info icons on the right
+    int innerX1 = x1 - 32; // leave room for info icons on the right
     int row = y0 + 40;
     int dy = 26;
 
-    int ySphere = row;          row += dy;
-    int yRing = row;          row += dy;
-    int ySens = row;          row += dy;
-    int yBass = row;          row += dy;
-    int yLowMid = row;          row += dy;
-    int yMid = row;          row += dy;
-    int yHigh = row;          row += dy;
-    int yAir = row;          row += dy;
+    int ySphere = row;   row += dy;
+    int yRing = row;   row += dy;
+    int ySens = row;   row += dy;
+    int yBass = row;   row += dy;
+    int yLowMid = row;   row += dy;
+    int yMid = row;   row += dy;
+    int yHigh = row;   row += dy;
+    int yAir = row;   row += dy;
 
     // Sliders
     draw_slider_bar(bits, w, h, innerX0, ySphere, innerX1, slider_t_from_value(0));
@@ -627,21 +753,12 @@ static void draw_settings_panel() {
 
     // Swap L/R checkbox
     int cbX = innerX0;
-    int cbY = yAir + 10;
+    int cbY = yAir + 12;
     int cbS = 12;
 
-    for (int yy = 0; yy < cbS; ++yy)
-        for (int xx = 0; xx < cbS; ++xx) {
-            BYTE a = (yy == 0 || yy == cbS - 1 || xx == 0 || xx == cbS - 1) ? 220 : 40;
-            putpx_PM(bits, w, h, cbX + xx, cbY + yy, a, 255, 255, 255);
-        }
+    draw_box_outline(bits, w, h, cbX, cbY, cbS);
+    if (gSwapLR) draw_check_mark(bits, w, h, cbX, cbY, cbS);
 
-    if (gSwapLR) {
-        for (int i = 2; i < cbS - 2; ++i)
-            putpx_PM(bits, w, h, cbX + i, cbY + i, 230, 255, 220, 80);
-        for (int i = 2; i < cbS - 2; ++i)
-            putpx_PM(bits, w, h, cbX + (cbS - 1 - i), cbY + i, 230, 255, 220, 80);
-    }
     TextOutW(dc, cbX + cbS + 6, cbY - 1, L"Swap L/R", 8);
 
     // Info icon for Swap L/R
@@ -650,11 +767,44 @@ static void draw_settings_panel() {
     draw_info_icon(bits, w, h, swapInfoX, swapInfoY);
     add_info_region(swapInfoX, swapInfoY, kInfoSwapLR);
 
+    // Add hit region for swap toggle (id 100)
+    add_hit_region(cbX, cbY - 4, cbX + cbS + 120, cbY + cbS + 4, 100);
+
+    // --- Game presets section ---
+    int presY = cbY + 28;
+    TextOutW(dc, innerX0, presY - 2, L"Game presets", 12);
+
+    // Info icon for presets
+    int presInfoX = x1 - 14;
+    int presInfoY = presY + 2;
+    draw_info_icon(bits, w, h, presInfoX, presInfoY);
+    add_info_region(presInfoX, presInfoY, kInfoPreset);
+
+    int pBoxS = 12;
+    int pRowY = presY + 18;
+
+    auto draw_preset_row = [&](int rowY, GamePreset preset, const wchar_t* name, int hitId) {
+        int bx = innerX0;
+        int by = rowY;
+        draw_box_outline(bits, w, h, bx, by, pBoxS);
+        if (gPreset == preset) draw_check_mark(bits, w, h, bx, by, pBoxS);
+        TextOutW(dc, bx + pBoxS + 6, by - 1, name, (int)wcslen(name));
+        add_hit_region(bx, by - 4, bx + 240, by + pBoxS + 4, hitId);
+        };
+
+    draw_preset_row(pRowY + 0, GamePreset::CS2, L"CS2", 200);
+    draw_preset_row(pRowY + 18, GamePreset::R6S, L"Rainbow Six Siege", 201);
+    draw_preset_row(pRowY + 36, GamePreset::COD, L"Call of Duty", 202);
+
+    // Small note line
+    SetTextColor(dc, RGB(220, 220, 220));
+    TextOutW(dc, innerX0, pRowY + 58, L"(Select one, then fine-tune sliders)", 36);
+    SetTextColor(dc, RGB(255, 255, 255));
+
     SelectObject(dc, oldF);
 }
 
 /* ===== Settings mode toggle ===== */
-
 static const wchar_t* kClassName = L"DeafOverlayWnd";
 enum : int { HK_TOGGLE_VIS = 1, HK_TOGGLE_CFG = 2 };
 
@@ -678,7 +828,6 @@ static void set_settings_mode(HWND h, bool on) {
 }
 
 /* ===== Render frame ===== */
-
 static void render_frame() {
     if (!g_dib.bits) return;
 
@@ -695,6 +844,9 @@ static void render_frame() {
     else {
         std::memset(bits, 0, (size_t)w * (size_t)h * 4);
     }
+
+    // Always draw hint box (visual only)
+    draw_hint_box();
 
     float cx = gSpherePosX * w;
     float cy = gSpherePosY * h;
@@ -716,7 +868,6 @@ static void render_frame() {
 }
 
 /* ===== Window proc ===== */
-
 LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
     switch (m) {
     case WM_NCHITTEST:
@@ -729,7 +880,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
             SetCapture(h);
             int mx = GET_X_LPARAM(lParam);
             int my = GET_Y_LPARAM(lParam);
-            int w = g_dib.w;
+            int ww = g_dib.w;
             int hh = g_dib.h;
 
             // 0) Info icons: if clicked, show description
@@ -744,20 +895,35 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
                 }
             }
 
+            // 0.5) General hit regions (checkboxes etc.)
+            for (int i = 0; i < gHitCount; ++i) {
+                const auto& hr = gHitRegions[i];
+                if (mx >= hr.x0 && mx <= hr.x1 && my >= hr.y0 && my <= hr.y1) {
+                    if (hr.id == 100) {
+                        gSwapLR = !gSwapLR;
+                        ReleaseCapture();
+                        return 0;
+                    }
+                    if (hr.id == 200) { set_preset_exclusive(GamePreset::CS2); ReleaseCapture(); return 0; }
+                    if (hr.id == 201) { set_preset_exclusive(GamePreset::R6S); ReleaseCapture(); return 0; }
+                    if (hr.id == 202) { set_preset_exclusive(GamePreset::COD); ReleaseCapture(); return 0; }
+                }
+            }
+
             // Reconstruct panel geometry (must match draw_settings_panel)
             int innerX0 = gPanelX + 12;
-            int innerX1 = gPanelX + PANEL_W - 28;
+            int innerX1 = gPanelX + PANEL_W - 32;
             int row = gPanelY + 40;
             int dy = 26;
 
-            int ySphere = row;          row += dy;
-            int yRing = row;          row += dy;
-            int ySens = row;          row += dy;
-            int yBass = row;          row += dy;
-            int yLowMid = row;          row += dy;
-            int yMid = row;          row += dy;
-            int yHigh = row;          row += dy;
-            int yAir = row;          row += dy;
+            int ySphere = row;   row += dy;
+            int yRing = row;   row += dy;
+            int ySens = row;   row += dy;
+            int yBass = row;   row += dy;
+            int yLowMid = row;   row += dy;
+            int yMid = row;   row += dy;
+            int yHigh = row;   row += dy;
+            int yAir = row;   row += dy;
 
             auto inSlider = [&](int sy) {
                 const int halfH = 10;
@@ -780,70 +946,21 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
             }
 
             // 2) Sliders
-            if (inSlider(ySphere)) {
-                gActiveSlider = 0;
-                slider_apply(0, (float)(mx - innerX0) / (float)(innerX1 - innerX0));
-                return 0;
-            }
-            if (inSlider(yRing)) {
-                gActiveSlider = 1;
-                slider_apply(1, (float)(mx - innerX0) / (float)(innerX1 - innerX0));
-                return 0;
-            }
-            if (inSlider(ySens)) {
-                gActiveSlider = 2;
-                slider_apply(2, (float)(mx - innerX0) / (float)(innerX1 - innerX0));
-                return 0;
-            }
-            if (inSlider(yBass)) {
-                gActiveSlider = 3;
-                slider_apply(3, (float)(mx - innerX0) / (float)(innerX1 - innerX0));
-                return 0;
-            }
-            if (inSlider(yLowMid)) {
-                gActiveSlider = 4;
-                slider_apply(4, (float)(mx - innerX0) / (float)(innerX1 - innerX0));
-                return 0;
-            }
-            if (inSlider(yMid)) {
-                gActiveSlider = 5;
-                slider_apply(5, (float)(mx - innerX0) / (float)(innerX1 - innerX0));
-                return 0;
-            }
-            if (inSlider(yHigh)) {
-                gActiveSlider = 6;
-                slider_apply(6, (float)(mx - innerX0) / (float)(innerX1 - innerX0));
-                return 0;
-            }
-            if (inSlider(yAir)) {
-                gActiveSlider = 7;
-                slider_apply(7, (float)(mx - innerX0) / (float)(innerX1 - innerX0));
-                return 0;
-            }
+            if (inSlider(ySphere)) { gActiveSlider = 0; slider_apply(0, (float)(mx - innerX0) / (float)(innerX1 - innerX0)); return 0; }
+            if (inSlider(yRing)) { gActiveSlider = 1; slider_apply(1, (float)(mx - innerX0) / (float)(innerX1 - innerX0)); return 0; }
+            if (inSlider(ySens)) { gActiveSlider = 2; slider_apply(2, (float)(mx - innerX0) / (float)(innerX1 - innerX0)); return 0; }
+            if (inSlider(yBass)) { gActiveSlider = 3; slider_apply(3, (float)(mx - innerX0) / (float)(innerX1 - innerX0)); return 0; }
+            if (inSlider(yLowMid)) { gActiveSlider = 4; slider_apply(4, (float)(mx - innerX0) / (float)(innerX1 - innerX0)); return 0; }
+            if (inSlider(yMid)) { gActiveSlider = 5; slider_apply(5, (float)(mx - innerX0) / (float)(innerX1 - innerX0)); return 0; }
+            if (inSlider(yHigh)) { gActiveSlider = 6; slider_apply(6, (float)(mx - innerX0) / (float)(innerX1 - innerX0)); return 0; }
+            if (inSlider(yAir)) { gActiveSlider = 7; slider_apply(7, (float)(mx - innerX0) / (float)(innerX1 - innerX0)); return 0; }
 
-            // 3) Swap L/R toggle
+            // 3) Sphere drag (inside sphere radius)
             {
-                int cbX = innerX0;
-                int cbY = yAir + 10;
-                int cbS = 12;
-                if (mx >= cbX && mx <= cbX + cbS + 70 &&
-                    my >= cbY - 4 && my <= cbY + cbS + 4)
-                {
-                    gSwapLR = !gSwapLR;
-                    gActiveSlider = -1;
-                    gDraggingPanel = false;
-                    gDraggingSphere = false;
-                    ReleaseCapture();
-                    return 0;
-                }
-            }
-
-            // 4) Sphere drag (inside sphere radius)
-            {
-                float cx = gSpherePosX * w;
+                float cx = gSpherePosX * ww;
                 float cy = gSpherePosY * hh;
                 float baseScale = 0.13f;
-                float sphereR = std::min(w, hh) * baseScale * gSphereScale;
+                float sphereR = std::min(ww, hh) * baseScale * gSphereScale;
                 float dx = (float)mx - cx;
                 float dy2 = (float)my - cy;
                 if (dx * dx + dy2 * dy2 <= sphereR * sphereR * 1.3f) {
@@ -863,10 +980,10 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
         if (gSettingsOpen && (wParam & MK_LBUTTON)) {
             int mx = GET_X_LPARAM(lParam);
             int my = GET_Y_LPARAM(lParam);
-            int w = g_dib.w;
+            int ww = g_dib.w;
             int hh = g_dib.h;
             int innerX0 = gPanelX + 12;
-            int innerX1 = gPanelX + PANEL_W - 28;
+            int innerX1 = gPanelX + PANEL_W - 32;
 
             if (gDraggingPanel) {
                 gPanelX = mx - gPanelDragOffX;
@@ -879,7 +996,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
                 return 0;
             }
             if (gDraggingSphere) {
-                gSpherePosX = std::clamp(mx / (float)w, 0.05f, 0.95f);
+                gSpherePosX = std::clamp(mx / (float)ww, 0.05f, 0.95f);
                 gSpherePosY = std::clamp(my / (float)hh, 0.05f, 0.95f);
                 return 0;
             }
@@ -916,7 +1033,6 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
 }
 
 /* ===== Entry / main loop ===== */
-
 int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     // DPI awareness
     using SetProcessDpiAwarenessContext_t = BOOL(WINAPI*)(HANDLE);
@@ -1065,6 +1181,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
 
             float ild = (gSwapLR ? (L - R) : (R - L)) / S; // + = right
             ild = std::clamp(ild, -1.f, 1.f);
+            (void)ild;
 
             float center = std::min(L, R);
             float left = std::max(0.f, L - R);
