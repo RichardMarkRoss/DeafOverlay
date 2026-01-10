@@ -89,6 +89,34 @@ static float gBandGain[NB] = { 1.f,1.f,1.f,1.f,1.f,1.f };
 enum class GamePreset : int { None = 0, CS2, R6S, COD };
 static GamePreset gPreset = GamePreset::None;
 
+static void force_alpha_rect(void* bits, int w, int h, int x0, int y0, int x1, int y1) {
+    x0 = std::max(0, x0); y0 = std::max(0, y0);
+    x1 = std::min(w, x1); y1 = std::min(h, y1);
+
+    for (int y = y0; y < y1; ++y) {
+        BYTE* row = (BYTE*)bits + ((size_t)y * w + x0) * 4;
+        for (int x = x0; x < x1; ++x) {
+            row[3] = 255; // alpha channel
+            row += 4;
+        }
+    }
+}
+
+static void text_out_opaque(HDC dc, void* bits, int w, int h, int x, int y, const wchar_t* s) {
+    int len = (int)wcslen(s);
+
+    // Draw text (RGB)
+    TextOutW(dc, x, y, s, len);
+
+    // Measure the exact drawn area
+    SIZE sz{};
+    GetTextExtentPoint32W(dc, s, len, &sz);
+
+    // Force alpha to opaque where the text lives (+2px padding for glyph edges)
+    force_alpha_rect(bits, w, h, x - 2, y - 2, x + sz.cx + 2, y + sz.cy + 2);
+}
+
+
 static void apply_preset(GamePreset p) {
     gPreset = p;
 
@@ -457,19 +485,6 @@ static inline void level_to_color(float s, BYTE& r, BYTE& g, BYTE& b) {
     b = (BYTE)std::clamp(255.0f - s * 255.0f, 0.0f, 255.0f);
 }
 
-static void force_alpha_rect(void* bits, int w, int h, int x0, int y0, int x1, int y1) {
-    x0 = std::max(0, x0); y0 = std::max(0, y0);
-    x1 = std::min(w, x1); y1 = std::min(h, y1);
-
-    for (int y = y0; y < y1; ++y) {
-        BYTE* row = (BYTE*)bits + ((size_t)y * w + x0) * 4;
-        for (int x = x0; x < x1; ++x) {
-            row[3] = 255; // alpha channel
-            row += 4;
-        }
-    }
-}
-
 static void add_peak_merge(const Peak& q) {
     int best = -1;
     float bestD = 1e9f;
@@ -814,9 +829,9 @@ static void draw_hint_box() {
     HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     HFONT oldF = (HFONT)SelectObject(dc, hFont);
 
-    TextOutW(dc, x0 + 10, y0 + 2, L"DeafOverlay Hotkeys", 18);
-    TextOutW(dc, x0 + 10, y0 + 22, L"Alt+H: Show/Hide   Alt+I: Settings", 36);
-    TextOutW(dc, x0 + 10, y0 + 40, L"Best accuracy: Stereo + Spatial OFF", 35);
+    text_out_opaque(dc, bits, w, h, x0 + 10, y0 + 2, L"DeafOverlay Hotkeys");
+    text_out_opaque(dc, bits, w, h, x0 + 10, y0 + 22, L"Alt+H: Show/Hide   Alt+I: Settings   Alt+Q: Quit");
+    text_out_opaque(dc, bits, w, h, x0 + 10, y0 + 40, L"Best accuracy: Stereo + Spatial OFF");
 
     SelectObject(dc, oldF);
 }
@@ -874,15 +889,14 @@ static void draw_settings_panel() {
 
     HDC dc = g_dib.dc;
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, RGB(255, 255, 255));
+    SetTextColor(dc, RGB(255, 255, 225));
     HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     HFONT oldF = (HFONT)SelectObject(dc, hFont);
 
-    TextOutW(dc, x0 + 10, y0 + 5, L"DeafOverlay Settings", 21);
-    force_alpha_rect(bits, w, h, x0 + 10, y0 + 5, x0 + 10 + 220, y0 + 5 + 18);
+    text_out_opaque(dc, bits, w, h, x0 + 10, y0 + 5, L"DeafOverlay Settings");
 
     auto label_with_info = [&](int y, const wchar_t* txt, const wchar_t* info) {
-        TextOutW(dc, innerX0, y - 14, txt, (int)wcslen(txt));
+        text_out_opaque(dc, bits, w, h, innerX0, y - 14, txt);
         int ix = x1 - 14;
         int iy = y - 10;
         draw_info_icon(bits, w, h, ix, iy);
@@ -906,7 +920,7 @@ static void draw_settings_panel() {
     draw_box_outline(bits, w, h, cbX, cbY, cbS);
     if (gSwapLR) draw_check_mark(bits, w, h, cbX, cbY, cbS);
 
-    TextOutW(dc, cbX + cbS + 6, cbY - 1, L"Swap L/R", 8);
+    text_out_opaque(dc, bits, w, h, cbX + cbS + 6, cbY - 1, L"Swap L/R");
 
     int swapInfoX = x1 - 14;
     int swapInfoY = cbY + 2;
@@ -917,7 +931,7 @@ static void draw_settings_panel() {
 
     // Game presets
     int presY = cbY + 28;
-    TextOutW(dc, innerX0, presY - 2, L"Game presets", 12);
+    text_out_opaque(dc, bits, w, h, innerX0, presY - 2, L"Game presets");
 
     int presInfoX = x1 - 14;
     int presInfoY = presY + 2;
@@ -932,7 +946,7 @@ static void draw_settings_panel() {
         int by = rowY;
         draw_box_outline(bits, w, h, bx, by, pBoxS);
         if (gPreset == preset) draw_check_mark(bits, w, h, bx, by, pBoxS);
-        TextOutW(dc, bx + pBoxS + 6, by - 1, name, (int)wcslen(name));
+        text_out_opaque(dc, bits, w, h, bx + pBoxS + 6, by - 1, name);
         add_hit_region(bx, by - 4, bx + 240, by + pBoxS + 4, hitId);
         };
 
@@ -941,7 +955,7 @@ static void draw_settings_panel() {
     draw_preset_row(pRowY + 36, GamePreset::COD, L"Call of Duty", 202);
 
     SetTextColor(dc, RGB(220, 220, 220));
-    TextOutW(dc, innerX0, pRowY + 58, L"(Select one, then fine-tune sliders)", 36);
+    text_out_opaque(dc, bits, w, h, innerX0, pRowY + 58, L"(Select one, then fine-tune sliders)");
     SetTextColor(dc, RGB(255, 255, 255));
 
     SelectObject(dc, oldF);
@@ -949,7 +963,7 @@ static void draw_settings_panel() {
 
 /* ===== Settings mode toggle ===== */
 static const wchar_t* kClassName = L"DeafOverlayWnd";
-enum : int { HK_TOGGLE_VIS = 1, HK_TOGGLE_CFG = 2 };
+enum : int { HK_TOGGLE_VIS = 1, HK_TOGGLE_CFG = 2, HK_QUIT = 3 };
 
 static void set_settings_mode(HWND h, bool on) {
     gSettingsOpen = on;
@@ -1212,6 +1226,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
 
     RegisterHotKey(h, HK_TOGGLE_VIS, MOD_ALT | MOD_NOREPEAT, 'H');
     RegisterHotKey(h, HK_TOGGLE_CFG, MOD_ALT | MOD_NOREPEAT, 'I');
+    RegisterHotKey(h, HK_QUIT, MOD_ALT | MOD_NOREPEAT, 'Q'); // Alt+Q = Quit
 
     g_dib = make_dib(screenW, screenH);
     gPanelX = 40;
@@ -1257,6 +1272,10 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
                     }
                     set_settings_mode(h, !gSettingsOpen);
+                }
+                else if (msg.wParam == HK_QUIT) {
+                    save_settings_file();
+                    PostQuitMessage(0);
                 }
                 continue;
             }
