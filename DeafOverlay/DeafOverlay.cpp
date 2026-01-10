@@ -1,4 +1,4 @@
-﻿// DeafOverlay.cpp — Fullscreen spatial overlay with settings, per-band controls, info tooltips, and game presets
+﻿// DeafOverlay.cpp — Fullscreen spatial overlay with settings, per-band controls, info tooltips, and accuracy-first defaults
 // - Alt+H: toggle overlay
 // - Alt+I: settings mode
 //   * Fullscreen dark background (captures clicks)
@@ -13,6 +13,15 @@
 // - Static hint box at top-left (always visible): hotkeys reminder
 // - Normal mode: click-through, transparent, spatial visual only
 // - Uses WASAPI loopback via miniaudio
+//
+// ACCURACY-FIRST changes added:
+// 1) One-time first-run guidance (stereo output, spatializers OFF) stored in HKCU registry.
+// 2) Auto noise-floor tracking per band + auto gain normalization ("install and done").
+// 3) Confidence gating: rear + elevation cues only when confident (reduce “confidently wrong”).
+// 4) Transient emphasis: direction authority favors transients (shots/steps) over ambience.
+// 5) Extra conservative defaults for rear/elev; front-biased behavior.
+//
+// NOTE: This is still loopback-stereo based. True 3D (perfect front/back & height) needs engine/object data.
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -29,8 +38,14 @@
 #include <cmath>
 #include <algorithm>
 #include <cstring>
+#include <shlobj.h>      // SHGetKnownFolderPath
+#include <string>
+#include <fstream>
+#include <iterator>
+#include <filesystem>
 
 #pragma comment(lib, "Dwmapi.lib")
+#pragma comment(lib, "Shell32.lib")
 
 /* ===== Base tunables ===== */
 static constexpr float BASE_SENS_GAIN = 0.95f;
@@ -38,6 +53,21 @@ static constexpr float MAX_AZIMUTH_DEG = 78.0f;   // per-side span on ring
 static constexpr float PEAK_DECAY_HZ = 1.7f;
 static constexpr float ELEV_SCALE = 0.30f;
 static constexpr float REAR_SCALE = 1.00f;
+
+/* ===== Accuracy-first tunables (new) ===== */
+static constexpr float FLOOR_ATTACK = 0.0035f;  // how fast noise floor rises
+static constexpr float FLOOR_RELEASE = 0.0008f;  // how fast noise floor falls
+static constexpr float FLOOR_MULT = 1.25f;    // subtract floor*mult from energy
+static constexpr float AUTO_GAIN_RATE = 0.015f;   // how fast auto gain adapts
+static constexpr float TARGET_LEVEL = 0.24f;    // target normalized “activity” for easy visibility
+
+static constexpr float TRANSIENT_ALPHA = 0.20f;   // transient detector smoothing
+static constexpr float TRANSIENT_HI = 0.18f;   // transient threshold (normalized) for “direction authority”
+
+static constexpr float REAR_MIN_CONF = 0.55f;   // minimum rear confidence to show rear
+static constexpr float REAR_HI_CONF = 0.70f;   // stronger rear confidence
+static constexpr float ELEV_MIN_MAG = 0.42f;   // minimum |elev| to show elevation
+static constexpr float ELEV_TRANSIENT_BOOST = 0.25f; // transient helps elevation slightly
 
 /* ===== Runtime user settings ===== */
 static float gSphereScale = 1.0f;   // slider: 0.6 .. 1.6
@@ -56,36 +86,25 @@ static constexpr int NB = 6;
 static float gBandGain[NB] = { 1.f,1.f,1.f,1.f,1.f,1.f };
 
 /* ===== Game presets ===== */
-enum class GamePreset : int {
-    None = 0,
-    CS2,
-    R6S,
-    COD
-};
+enum class GamePreset : int { None = 0, CS2, R6S, COD };
 static GamePreset gPreset = GamePreset::None;
 
 static void apply_preset(GamePreset p) {
     gPreset = p;
 
-    // Reasonable “starter” tuning (you can refine with real gameplay tests):
     // Bands: 0 Bass (0-250), 1 LowMid (250-2k), 2 Mid (2-5k), 3 HighMid (5-8k), 4 Air (8-12k), 5 Ultra/Total (12k+ / residual)
-    if (p == GamePreset::None) {
-        // Do nothing (keep current)
-        return;
-    }
+    if (p == GamePreset::None) return;
 
     if (p == GamePreset::CS2) {
-        // CS2: footsteps/utility detail often sits in mids/high-mids; tame bass rumble.
         gSensitivity = 1.20f;
-        gBandGain[0] = 0.75f; // bass down
+        gBandGain[0] = 0.75f;
         gBandGain[1] = 1.05f;
-        gBandGain[2] = 1.35f; // mid up
-        gBandGain[3] = 1.45f; // high-mid up
-        gBandGain[4] = 1.20f; // air slightly up
+        gBandGain[2] = 1.35f;
+        gBandGain[3] = 1.45f;
+        gBandGain[4] = 1.20f;
         gBandGain[5] = 1.00f;
     }
     else if (p == GamePreset::R6S) {
-        // R6 Siege: lots of subtle movement + gadget cues; favor low-mid through high-mid, keep bass controlled.
         gSensitivity = 1.25f;
         gBandGain[0] = 0.85f;
         gBandGain[1] = 1.20f;
@@ -95,7 +114,6 @@ static void apply_preset(GamePreset p) {
         gBandGain[5] = 1.00f;
     }
     else if (p == GamePreset::COD) {
-        // Call of Duty: explosions can drown detail; keep bass but boost low-mid/mid to retain footsteps/reload presence.
         gSensitivity = 1.10f;
         gBandGain[0] = 1.10f;
         gBandGain[1] = 1.25f;
@@ -107,11 +125,7 @@ static void apply_preset(GamePreset p) {
 }
 
 static void set_preset_exclusive(GamePreset p) {
-    if (gPreset == p) {
-        // uncheck -> go None (leave current values as-is)
-        gPreset = GamePreset::None;
-        return;
-    }
+    if (gPreset == p) { gPreset = GamePreset::None; return; }
     apply_preset(p);
 }
 
@@ -133,18 +147,12 @@ static int gActiveSlider = -1;
 static bool gDraggingSphere = false;
 
 /* ===== Info button support ===== */
-struct InfoRegion {
-    int x0, y0, x1, y1;
-    const wchar_t* text;
-};
+struct InfoRegion { int x0, y0, x1, y1; const wchar_t* text; };
 static InfoRegion gInfoRegions[48];
 static int gInfoCount = 0;
 
 /* ===== Preset checkbox hit regions ===== */
-struct HitRegion {
-    int x0, y0, x1, y1;
-    int id; // arbitrary
-};
+struct HitRegion { int x0, y0, x1, y1; int id; };
 static HitRegion gHitRegions[32];
 static int gHitCount = 0;
 
@@ -244,33 +252,180 @@ static void blit_layered(HWND hWnd, HDC src, int w, int h) {
     UpdateLayeredWindow(hWnd, nullptr, &pos, &sz, src, &srcpt, 0, &bf, ULW_ALPHA);
 }
 
+/* ===== Settings File (Option A): %APPDATA%\DeafOverlay\settings.json ===== */
+static std::filesystem::path get_settings_path() {
+    PWSTR roaming = nullptr;
+    std::filesystem::path p = L"settings.json";
+
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &roaming)) && roaming) {
+        std::filesystem::path dir = std::filesystem::path(roaming) / L"DeafOverlay";
+        CoTaskMemFree(roaming);
+
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec); // ok if already exists
+
+        p = dir / L"settings.json";
+    }
+    return p;
+}
+
+static bool json_find_number(const std::string& s, const char* key, float& out) {
+    size_t p = s.find(key);
+    if (p == std::string::npos) return false;
+    p = s.find(':', p);
+    if (p == std::string::npos) return false;
+    ++p;
+    while (p < s.size() && (s[p] == ' ' || s[p] == '\t')) ++p;
+
+    out = (float)std::atof(s.c_str() + p);
+    return true;
+}
+
+static bool json_find_int(const std::string& s, const char* key, int& out) {
+    float v = 0.f;
+    if (!json_find_number(s, key, v)) return false;
+    out = (int)v;
+    return true;
+}
+
+static void save_settings_file() {
+    std::filesystem::path path = get_settings_path();
+
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return;
+
+    f << "{\n";
+    f << "  \"sphereScale\": " << gSphereScale << ",\n";
+    f << "  \"ringOffsetY\": " << gRingOffsetY << ",\n";
+    f << "  \"sensitivity\": " << gSensitivity << ",\n";
+    f << "  \"swapLR\": " << (gSwapLR ? 1 : 0) << ",\n";
+    f << "  \"spherePosX\": " << gSpherePosX << ",\n";
+    f << "  \"spherePosY\": " << gSpherePosY << ",\n";
+    f << "  \"preset\": " << (int)gPreset << ",\n";
+    f << "  \"bandGain\": [";
+    for (int i = 0; i < NB; ++i) {
+        f << gBandGain[i];
+        if (i + 1 < NB) f << ", ";
+    }
+    f << "]\n";
+    f << "}\n";
+}
+
+static void load_settings_file() {
+    std::filesystem::path path = get_settings_path();
+
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return;
+
+    std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+
+    json_find_number(s, "\"sphereScale\"", gSphereScale);
+    json_find_number(s, "\"ringOffsetY\"", gRingOffsetY);
+    json_find_number(s, "\"sensitivity\"", gSensitivity);
+
+    float swap = 0.f;
+    if (json_find_number(s, "\"swapLR\"", swap)) gSwapLR = (swap >= 0.5f);
+
+    json_find_number(s, "\"spherePosX\"", gSpherePosX);
+    json_find_number(s, "\"spherePosY\"", gSpherePosY);
+
+    int preset = 0;
+    if (json_find_int(s, "\"preset\"", preset)) gPreset = (GamePreset)preset;
+
+    // bandGain array
+    size_t p = s.find("\"bandGain\"");
+    if (p != std::string::npos) {
+        p = s.find('[', p);
+        size_t q = s.find(']', p);
+        if (p != std::string::npos && q != std::string::npos && q > p) {
+            std::string arr = s.substr(p + 1, q - (p + 1));
+
+            size_t start = 0;
+            for (int i = 0; i < NB; ++i) {
+                // Skip commas for i-th value
+                if (i > 0) {
+                    start = arr.find(',', start);
+                    if (start == std::string::npos) break;
+                    start++;
+                }
+                while (start < arr.size() && (arr[start] == ' ' || arr[start] == '\t')) start++;
+                if (start >= arr.size()) break;
+
+                gBandGain[i] = (float)std::atof(arr.c_str() + start);
+            }
+        }
+    }
+
+    // Clamp for safety
+    gSphereScale = std::clamp(gSphereScale, 0.6f, 1.6f);
+    gRingOffsetY = std::clamp(gRingOffsetY, 0.40f, 0.90f);
+    gSensitivity = std::clamp(gSensitivity, 0.5f, 2.0f);
+
+    for (int i = 0; i < NB; ++i) gBandGain[i] = std::clamp(gBandGain[i], 0.0f, 3.0f);
+
+    gSpherePosX = std::clamp(gSpherePosX, 0.05f, 0.95f);
+    gSpherePosY = std::clamp(gSpherePosY, 0.05f, 0.95f);
+}
+
+
+/* ===== First-run “accuracy setup” guidance (new) ===== */
+static bool reg_read_dword(HKEY root, const wchar_t* path, const wchar_t* name, DWORD& outVal) {
+    HKEY h{};
+    if (RegOpenKeyExW(root, path, 0, KEY_READ, &h) != ERROR_SUCCESS) return false;
+    DWORD type = 0, sz = sizeof(DWORD);
+    DWORD v = 0;
+    LONG rc = RegQueryValueExW(h, name, nullptr, &type, (LPBYTE)&v, &sz);
+    RegCloseKey(h);
+    if (rc == ERROR_SUCCESS && type == REG_DWORD) { outVal = v; return true; }
+    return false;
+}
+static void reg_write_dword(HKEY root, const wchar_t* path, const wchar_t* name, DWORD val) {
+    HKEY h{};
+    DWORD disp = 0;
+    if (RegCreateKeyExW(root, path, 0, nullptr, 0, KEY_WRITE, nullptr, &h, &disp) != ERROR_SUCCESS) return;
+    RegSetValueExW(h, name, 0, REG_DWORD, (const BYTE*)&val, sizeof(val));
+    RegCloseKey(h);
+}
+
+static void show_first_run_guidance(HWND hWnd) {
+    const wchar_t* kKeyPath = L"Software\\DeafOverlay";
+    DWORD done = 0;
+    if (reg_read_dword(HKEY_CURRENT_USER, kKeyPath, L"OnboardingDone", done) && done == 1) return;
+
+    const wchar_t* msg =
+        L"Best Accuracy Setup (Recommended)\n\n"
+        L"DeafOverlay reads the FINAL system audio (WASAPI loopback).\n"
+        L"For the most accurate direction cues, please set:\n\n"
+        L"1) Windows output: STEREO\n"
+        L"2) Turn OFF spatial/surround effects:\n"
+        L"   - Windows Sonic\n"
+        L"   - Dolby Atmos for Headphones\n"
+        L"   - DTS / THX / headset “Surround” modes\n\n"
+        L"Why: Stacking spatializers makes direction unreliable.\n\n"
+        L"Tip: If left/right feels reversed, use “Swap L/R” in settings (Alt+I).";
+
+    MessageBoxW(hWnd, msg, L"DeafOverlay — Accuracy Setup", MB_OK | MB_ICONINFORMATION);
+    reg_write_dword(HKEY_CURRENT_USER, kKeyPath, L"OnboardingDone", 1);
+}
+
 /* ===== Info icon helpers ===== */
 static void add_info_region(int cx, int cy, const wchar_t* text) {
     if (gInfoCount >= (int)(sizeof(gInfoRegions) / sizeof(gInfoRegions[0]))) return;
     int r = 7;
     gInfoRegions[gInfoCount++] = { cx - r, cy - r, cx + r, cy + r, text };
 }
-
 static void draw_info_icon(void* bits, int w, int h, int cx, int cy) {
     int r = 6;
-    // Circle
-    for (int dy = -r; dy <= r; ++dy) {
-        for (int dx = -r; dx <= r; ++dx) {
-            if (dx * dx + dy * dy <= r * r) {
-                BYTE a = 220;
-                putpx_PM(bits, w, h, cx + dx, cy + dy, a, 40, 40, 60);
-            }
-        }
-    }
-    // "i"
+    for (int dy = -r; dy <= r; ++dy)
+        for (int dx = -r; dx <= r; ++dx)
+            if (dx * dx + dy * dy <= r * r)
+                putpx_PM(bits, w, h, cx + dx, cy + dy, 220, 40, 40, 60);
     putpx_PM(bits, w, h, cx, cy - 2, 255, 255, 255, 255);
-    for (int yy = -1; yy <= 2; ++yy)
-        putpx_PM(bits, w, h, cx, cy + yy, 255, 255, 255, 255);
+    for (int yy = -1; yy <= 2; ++yy) putpx_PM(bits, w, h, cx, cy + yy, 255, 255, 255, 255);
 }
 
 /* ===== Band energies (atomic from callback) ===== */
 static std::atomic<float> gEL[NB], gER[NB];
-
 static inline float lp_step(float y, float x, float a) { return y + a * (x - y); }
 
 /* ===== Peaks / elevation ===== */
@@ -279,6 +434,12 @@ static float gBackB[NB] = { 0 };
 static float gFrontB[NB] = { 0 };
 static float gElevS = 0.f;
 static inline float ema(float prev, float x, float a) { return prev + a * (x - prev); }
+
+/* ===== Accuracy-first runtime state (new) ===== */
+static float gFloorL[NB] = { 0 }, gFloorR[NB] = { 0 };
+static float gAutoGain = 1.0f;
+static float gTransient = 0.0f;      // smoothed transient measure
+static float gPrevTot = 0.0f;        // last total activity
 
 struct Peak {
     float ang = 0.f;
@@ -296,6 +457,19 @@ static inline void level_to_color(float s, BYTE& r, BYTE& g, BYTE& b) {
     b = (BYTE)std::clamp(255.0f - s * 255.0f, 0.0f, 255.0f);
 }
 
+static void force_alpha_rect(void* bits, int w, int h, int x0, int y0, int x1, int y1) {
+    x0 = std::max(0, x0); y0 = std::max(0, y0);
+    x1 = std::min(w, x1); y1 = std::min(h, y1);
+
+    for (int y = y0; y < y1; ++y) {
+        BYTE* row = (BYTE*)bits + ((size_t)y * w + x0) * 4;
+        for (int x = x0; x < x1; ++x) {
+            row[3] = 255; // alpha channel
+            row += 4;
+        }
+    }
+}
+
 static void add_peak_merge(const Peak& q) {
     int best = -1;
     float bestD = 1e9f;
@@ -310,7 +484,10 @@ static void add_peak_merge(const Peak& q) {
         float sx = std::sinf(p.ang) * sA + std::sinf(q.ang) * sB;
         float sy = -std::cosf(p.ang) * sA + -std::cosf(q.ang) * sB;
         p.ang = std::atan2f(sx, -sy);
-        p.amp = std::clamp(sA + 0.65f * sB, 0.f, 1.f);
+
+        // conservative amplitude merge (avoid sudden “lies”)
+        p.amp = std::clamp(std::max(sA, 0.70f * sA + 0.55f * sB), 0.f, 1.f);
+
         p.rearGain = std::max(p.rearGain, q.rearGain);
         p.elevFactor = 0.5f * (p.elevFactor + q.elevFactor);
         if (sB > sA) p.band = q.band;
@@ -318,7 +495,6 @@ static void add_peak_merge(const Peak& q) {
         return;
     }
 
-    // Insert / replace lowest amp
     int slot = 0;
     for (int i = 1; i < (int)std::size(g_peaks); ++i)
         if (g_peaks[i].amp < g_peaks[slot].amp) slot = i;
@@ -380,7 +556,7 @@ void MA_API audio_cb(ma_device* dev, void*, const void* pIn, ma_uint32 frames) {
     bR[4] = std::max(0.f, lp12kR - lp8kR);
     bR[5] = std::max(0.f, totR - lp12kR);
 
-    // Global & per-band gain
+    // Global & per-band gain (user sensitivity only; auto gain is applied in main loop)
     float g = 1.8f * BASE_SENS_GAIN * gSensitivity;
 
     // Subtle built-in emphasis for lows/mids
@@ -485,16 +661,13 @@ static void draw_ring(void* bits, int w, int h, float cx, float cy, float a, flo
             for (int j = 0; j < 7; ++j) {
                 int xi = int(ex + nx * i + (a * 0.035f) * tx * j);
                 int yi = int(ey + ny * i + (b * 0.035f) * ty * j);
-                putpx_PM(bits, w, h, xi, yi,
-                    (BYTE)(120 + 100 * p.amp), rr, gg, bb);
+                putpx_PM(bits, w, h, xi, yi, (BYTE)(120 + 100 * p.amp), rr, gg, bb);
             }
         }
     }
 }
 
-static void draw_sphere(void* bits, int w, int h,
-    float cx, float cy, float radius, float tilt_deg)
-{
+static void draw_sphere(void* bits, int w, int h, float cx, float cy, float radius, float tilt_deg) {
     const float tilt = tilt_deg * PI_F / 180.f;
     const float ct = std::cos(tilt), st = std::sin(tilt);
     const int latSteps = 16, lonSteps = 36;
@@ -535,8 +708,7 @@ static void draw_sphere(void* bits, int w, int h,
             float grow = 1.0f + 0.22f * std::max(0.0f, alignBest);
             int   dotR = std::max(2, int(radius * 0.012f * grow));
             float depth = (z2 * 0.5f + 0.5f);
-            float bright = (0.55f + 0.55f * depth +
-                0.95f * std::max(0.0f, alignBest));
+            float bright = (0.55f + 0.55f * depth + 0.95f * std::max(0.0f, alignBest));
 
             BYTE rr, gg, bb; level_to_color(ampBest, rr, gg, bb);
             BYTE a = (BYTE)std::clamp(int(24 + 200 * bright), 0, 238);
@@ -556,16 +728,14 @@ static void draw_sphere(void* bits, int w, int h,
         float fx = std::sinf(p.ang), fy = -std::cosf(p.ang);
         int len = int(radius * 0.9f);
         for (int i = 0; i < len; ++i)
-            putpx_PM(bits, w, h, int(cx + fx * i), int(cy + fy * i),
-                (BYTE)(40 + 150 * p.amp), rr, gg, bb);
+            putpx_PM(bits, w, h, int(cx + fx * i), int(cy + fy * i), (BYTE)(40 + 150 * p.amp), rr, gg, bb);
 
         if (p.rearGain > 0.f) {
             float rx = std::sinf(p.ang + PI_F), ry = -std::cosf(p.ang + PI_F);
             int rlen = int(radius * 0.55f);
             BYTE a = (BYTE)std::clamp(int((20 + 160 * p.rearGain) * REAR_SCALE), 0, 255);
             for (int i = 0; i < rlen; ++i)
-                putpx_PM(bits, w, h, int(cx + rx * i), int(cy + ry * i),
-                    a, 200, 220, 255);
+                putpx_PM(bits, w, h, int(cx + rx * i), int(cy + ry * i), a, 200, 220, 255);
         }
     }
 }
@@ -573,31 +743,19 @@ static void draw_sphere(void* bits, int w, int h,
 /* ===== Slider helpers ===== */
 static void slider_apply(int idx, float t) {
     t = std::clamp(t, 0.0f, 1.0f);
-    if (idx == 0) {
-        gSphereScale = 0.6f + t * (1.6f - 0.6f);
-    }
-    else if (idx == 1) {
-        gRingOffsetY = 0.40f + t * (0.90f - 0.40f);
-    }
-    else if (idx == 2) {
-        gSensitivity = 0.5f + t * (2.0f - 0.5f);
-    }
+    if (idx == 0) gSphereScale = 0.6f + t * (1.6f - 0.6f);
+    else if (idx == 1) gRingOffsetY = 0.40f + t * (0.90f - 0.40f);
+    else if (idx == 2) gSensitivity = 0.5f + t * (2.0f - 0.5f);
     else if (idx >= 3 && idx < 3 + NB) {
         int b = idx - 3;
-        if (t <= 0.5f)
-            gBandGain[b] = (t / 0.5f) * 1.0f;                 // 0..1
-        else
-            gBandGain[b] = 1.0f + ((t - 0.5f) / 0.5f) * 2.0f; // 1..3
+        if (t <= 0.5f) gBandGain[b] = (t / 0.5f) * 1.0f;
+        else gBandGain[b] = 1.0f + ((t - 0.5f) / 0.5f) * 2.0f;
     }
 }
-
 static float slider_t_from_value(int idx) {
-    if (idx == 0)
-        return std::clamp((gSphereScale - 0.6f) / (1.6f - 0.6f), 0.0f, 1.0f);
-    if (idx == 1)
-        return std::clamp((gRingOffsetY - 0.40f) / (0.90f - 0.40f), 0.0f, 1.0f);
-    if (idx == 2)
-        return std::clamp((gSensitivity - 0.5f) / (2.0f - 0.5f), 0.0f, 1.0f);
+    if (idx == 0) return std::clamp((gSphereScale - 0.6f) / (1.6f - 0.6f), 0.0f, 1.0f);
+    if (idx == 1) return std::clamp((gRingOffsetY - 0.40f) / (0.90f - 0.40f), 0.0f, 1.0f);
+    if (idx == 2) return std::clamp((gSensitivity - 0.5f) / (2.0f - 0.5f), 0.0f, 1.0f);
     if (idx >= 3 && idx < 3 + NB) {
         int b = idx - 3;
         float gg = std::clamp(gBandGain[b], 0.0f, 3.0f);
@@ -606,13 +764,8 @@ static float slider_t_from_value(int idx) {
     }
     return 0.0f;
 }
-
-static void draw_slider_bar(void* bits, int w, int h,
-    int x0, int y, int x1, float t)
-{
-    for (int x = x0; x <= x1; ++x)
-        putpx_PM(bits, w, h, x, y, 90, 220, 220, 220);
-
+static void draw_slider_bar(void* bits, int w, int h, int x0, int y, int x1, float t) {
+    for (int x = x0; x <= x1; ++x) putpx_PM(bits, w, h, x, y, 90, 220, 220, 220);
     int knobX = x0 + int(t * float(x1 - x0));
     for (int dy = -4; dy <= 4; ++dy)
         for (int dx = -3; dx <= 3; ++dx)
@@ -628,7 +781,6 @@ static void draw_box_outline(void* bits, int w, int h, int x, int y, int s, BYTE
         }
 }
 static void draw_check_mark(void* bits, int w, int h, int x, int y, int s) {
-    // simple X mark
     for (int i = 2; i < s - 2; ++i) {
         putpx_PM(bits, w, h, x + i, y + i, 230, 255, 220, 80);
         putpx_PM(bits, w, h, x + (s - 1 - i), y + i, 230, 255, 220, 80);
@@ -643,17 +795,15 @@ static void draw_hint_box() {
 
     const int x0 = 14;
     const int y0 = 14;
-    const int bw = 290;
-    const int bh = 54;
+    const int bw = 310;
+    const int bh = 62;
     const int x1 = std::min(w - 14, x0 + bw);
     const int y1 = std::min(h - 14, y0 + bh);
 
-    // background
     for (int y = y0; y < y1; ++y)
         for (int x = x0; x < x1; ++x)
             putpx_PM(bits, w, h, x, y, 170, 12, 12, 14);
 
-    // top strip
     for (int y = y0; y < std::min(y1, y0 + 18); ++y)
         for (int x = x0; x < x1; ++x)
             putpx_PM(bits, w, h, x, y, 200, 28, 28, 34);
@@ -666,6 +816,7 @@ static void draw_hint_box() {
 
     TextOutW(dc, x0 + 10, y0 + 2, L"DeafOverlay Hotkeys", 18);
     TextOutW(dc, x0 + 10, y0 + 22, L"Alt+H: Show/Hide   Alt+I: Settings", 36);
+    TextOutW(dc, x0 + 10, y0 + 40, L"Best accuracy: Stereo + Spatial OFF", 35);
 
     SelectObject(dc, oldF);
 }
@@ -677,10 +828,9 @@ static void draw_settings_panel() {
     int w = g_dib.w, h = g_dib.h;
     void* bits = g_dib.bits;
 
-    gInfoCount = 0; // rebuild info hit regions
-    gHitCount = 0;  // rebuild UI hit regions
+    gInfoCount = 0;
+    gHitCount = 0;
 
-    // Clamp panel
     if (gPanelX < 10) gPanelX = 10;
     if (gPanelY < 10) gPanelY = 10;
     if (gPanelX + PANEL_W > w - 10) gPanelX = w - 10 - PANEL_W;
@@ -691,31 +841,28 @@ static void draw_settings_panel() {
     int x1 = x0 + PANEL_W;
     int y1 = y0 + PANEL_H;
 
-    // Background
     for (int y = y0; y < y1; ++y)
         for (int x = x0; x < x1; ++x)
             putpx_PM(bits, w, h, x, y, 205, 16, 16, 20);
 
-    // Title bar
     for (int y = y0; y < y0 + 24; ++y)
         for (int x = x0; x < x1; ++x)
             putpx_PM(bits, w, h, x, y, 235, 32, 32, 40);
 
     int innerX0 = x0 + 12;
-    int innerX1 = x1 - 32; // leave room for info icons on the right
+    int innerX1 = x1 - 32;
     int row = y0 + 40;
     int dy = 26;
 
-    int ySphere = row;   row += dy;
-    int yRing = row;   row += dy;
-    int ySens = row;   row += dy;
-    int yBass = row;   row += dy;
-    int yLowMid = row;   row += dy;
-    int yMid = row;   row += dy;
-    int yHigh = row;   row += dy;
-    int yAir = row;   row += dy;
+    int ySphere = row; row += dy;
+    int yRing = row; row += dy;
+    int ySens = row; row += dy;
+    int yBass = row; row += dy;
+    int yLowMid = row; row += dy;
+    int yMid = row; row += dy;
+    int yHigh = row; row += dy;
+    int yAir = row; row += dy;
 
-    // Sliders
     draw_slider_bar(bits, w, h, innerX0, ySphere, innerX1, slider_t_from_value(0));
     draw_slider_bar(bits, w, h, innerX0, yRing, innerX1, slider_t_from_value(1));
     draw_slider_bar(bits, w, h, innerX0, ySens, innerX1, slider_t_from_value(2));
@@ -725,7 +872,6 @@ static void draw_settings_panel() {
     draw_slider_bar(bits, w, h, innerX0, yHigh, innerX1, slider_t_from_value(6));
     draw_slider_bar(bits, w, h, innerX0, yAir, innerX1, slider_t_from_value(7));
 
-    // Text labels with info icons
     HDC dc = g_dib.dc;
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, RGB(255, 255, 255));
@@ -733,6 +879,7 @@ static void draw_settings_panel() {
     HFONT oldF = (HFONT)SelectObject(dc, hFont);
 
     TextOutW(dc, x0 + 10, y0 + 5, L"DeafOverlay Settings", 21);
+    force_alpha_rect(bits, w, h, x0 + 10, y0 + 5, x0 + 10 + 220, y0 + 5 + 18);
 
     auto label_with_info = [&](int y, const wchar_t* txt, const wchar_t* info) {
         TextOutW(dc, innerX0, y - 14, txt, (int)wcslen(txt));
@@ -761,20 +908,17 @@ static void draw_settings_panel() {
 
     TextOutW(dc, cbX + cbS + 6, cbY - 1, L"Swap L/R", 8);
 
-    // Info icon for Swap L/R
     int swapInfoX = x1 - 14;
     int swapInfoY = cbY + 2;
     draw_info_icon(bits, w, h, swapInfoX, swapInfoY);
     add_info_region(swapInfoX, swapInfoY, kInfoSwapLR);
 
-    // Add hit region for swap toggle (id 100)
     add_hit_region(cbX, cbY - 4, cbX + cbS + 120, cbY + cbS + 4, 100);
 
-    // --- Game presets section ---
+    // Game presets
     int presY = cbY + 28;
     TextOutW(dc, innerX0, presY - 2, L"Game presets", 12);
 
-    // Info icon for presets
     int presInfoX = x1 - 14;
     int presInfoY = presY + 2;
     draw_info_icon(bits, w, h, presInfoX, presInfoY);
@@ -796,7 +940,6 @@ static void draw_settings_panel() {
     draw_preset_row(pRowY + 18, GamePreset::R6S, L"Rainbow Six Siege", 201);
     draw_preset_row(pRowY + 36, GamePreset::COD, L"Call of Duty", 202);
 
-    // Small note line
     SetTextColor(dc, RGB(220, 220, 220));
     TextOutW(dc, innerX0, pRowY + 58, L"(Select one, then fine-tune sliders)", 36);
     SetTextColor(dc, RGB(255, 255, 255));
@@ -812,10 +955,10 @@ static void set_settings_mode(HWND h, bool on) {
     gSettingsOpen = on;
     LONG ex = GetWindowLongW(h, GWL_EXSTYLE);
     if (on) {
-        ex &= ~WS_EX_TRANSPARENT;  // capture clicks
+        ex &= ~WS_EX_TRANSPARENT;
     }
     else {
-        ex |= WS_EX_TRANSPARENT;   // click-through
+        ex |= WS_EX_TRANSPARENT;
         gActiveSlider = -1;
         gDraggingPanel = false;
         gDraggingSphere = false;
@@ -836,7 +979,6 @@ static void render_frame() {
     void* bits = g_dib.bits;
 
     if (gSettingsOpen) {
-        // Dark fullscreen mask
         for (int y = 0; y < h; ++y)
             for (int x = 0; x < w; ++x)
                 putpx_PM(bits, w, h, x, y, 160, 0, 0, 0);
@@ -845,13 +987,12 @@ static void render_frame() {
         std::memset(bits, 0, (size_t)w * (size_t)h * 4);
     }
 
-    // Always draw hint box (visual only)
     draw_hint_box();
 
     float cx = gSpherePosX * w;
     float cy = gSpherePosY * h;
 
-    float baseScale = 0.13f; // matches our 420px baseline feel
+    float baseScale = 0.13f;
     float sphereR = std::min(w, h) * baseScale * gSphereScale;
 
     draw_sphere(bits, w, h, cx, cy, sphereR, 22.f);
@@ -862,18 +1003,15 @@ static void render_frame() {
 
     draw_ring(bits, w, h, cx, ringY, rx, ry);
 
-    if (gSettingsOpen) {
-        draw_settings_panel();
-    }
+    if (gSettingsOpen) draw_settings_panel();
 }
 
 /* ===== Window proc ===== */
 LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
     switch (m) {
     case WM_NCHITTEST:
-        if (!gSettingsOpen)
-            return HTTRANSPARENT; // full click-through in normal mode
-        return HTCLIENT;          // settings mode: handle manually
+        if (!gSettingsOpen) return HTTRANSPARENT;
+        return HTCLIENT;
 
     case WM_LBUTTONDOWN:
         if (gSettingsOpen) {
@@ -883,59 +1021,65 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
             int ww = g_dib.w;
             int hh = g_dib.h;
 
-            // 0) Info icons: if clicked, show description
             for (int i = 0; i < gInfoCount; ++i) {
                 const auto& inf = gInfoRegions[i];
-                if (mx >= inf.x0 && mx <= inf.x1 &&
-                    my >= inf.y0 && my <= inf.y1) {
-                    MessageBoxW(h, inf.text, L"Overlay Setting Info",
-                        MB_OK | MB_ICONINFORMATION);
+                if (mx >= inf.x0 && mx <= inf.x1 && my >= inf.y0 && my <= inf.y1) {
+                    MessageBoxW(h, inf.text, L"Overlay Setting Info", MB_OK | MB_ICONINFORMATION);
                     ReleaseCapture();
                     return 0;
                 }
             }
 
-            // 0.5) General hit regions (checkboxes etc.)
             for (int i = 0; i < gHitCount; ++i) {
                 const auto& hr = gHitRegions[i];
                 if (mx >= hr.x0 && mx <= hr.x1 && my >= hr.y0 && my <= hr.y1) {
                     if (hr.id == 100) {
                         gSwapLR = !gSwapLR;
+                        save_settings_file();
                         ReleaseCapture();
                         return 0;
                     }
-                    if (hr.id == 200) { set_preset_exclusive(GamePreset::CS2); ReleaseCapture(); return 0; }
-                    if (hr.id == 201) { set_preset_exclusive(GamePreset::R6S); ReleaseCapture(); return 0; }
-                    if (hr.id == 202) { set_preset_exclusive(GamePreset::COD); ReleaseCapture(); return 0; }
+                    if (hr.id == 200) {
+                        set_preset_exclusive(GamePreset::CS2);
+                        save_settings_file();
+                        ReleaseCapture();
+                        return 0;
+                    }
+                    if (hr.id == 201) {
+                        set_preset_exclusive(GamePreset::R6S);
+                        save_settings_file();
+                        ReleaseCapture();
+                        return 0;
+                    }
+                    if (hr.id == 202) {
+                        set_preset_exclusive(GamePreset::COD);
+                        save_settings_file();
+                        ReleaseCapture();
+                        return 0;
+                    }
                 }
             }
 
-            // Reconstruct panel geometry (must match draw_settings_panel)
             int innerX0 = gPanelX + 12;
             int innerX1 = gPanelX + PANEL_W - 32;
             int row = gPanelY + 40;
             int dy = 26;
 
-            int ySphere = row;   row += dy;
-            int yRing = row;   row += dy;
-            int ySens = row;   row += dy;
-            int yBass = row;   row += dy;
-            int yLowMid = row;   row += dy;
-            int yMid = row;   row += dy;
-            int yHigh = row;   row += dy;
-            int yAir = row;   row += dy;
+            int ySphere = row; row += dy;
+            int yRing = row; row += dy;
+            int ySens = row; row += dy;
+            int yBass = row; row += dy;
+            int yLowMid = row; row += dy;
+            int yMid = row; row += dy;
+            int yHigh = row; row += dy;
+            int yAir = row; row += dy;
 
             auto inSlider = [&](int sy) {
                 const int halfH = 10;
-                return (mx >= innerX0 && mx <= innerX1 &&
-                    my >= sy - halfH && my <= sy + halfH);
+                return (mx >= innerX0 && mx <= innerX1 && my >= sy - halfH && my <= sy + halfH);
                 };
 
-            // 1) Panel drag via title bar
-            int px0 = gPanelX;
-            int py0 = gPanelY;
-            int px1 = px0 + PANEL_W;
-            int py1 = py0 + 24;
+            int px0 = gPanelX, py0 = gPanelY, px1 = px0 + PANEL_W, py1 = py0 + 24;
             if (mx >= px0 && mx <= px1 && my >= py0 && my <= py1) {
                 gDraggingPanel = true;
                 gPanelDragOffX = mx - gPanelX;
@@ -945,7 +1089,6 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
                 return 0;
             }
 
-            // 2) Sliders
             if (inSlider(ySphere)) { gActiveSlider = 0; slider_apply(0, (float)(mx - innerX0) / (float)(innerX1 - innerX0)); return 0; }
             if (inSlider(yRing)) { gActiveSlider = 1; slider_apply(1, (float)(mx - innerX0) / (float)(innerX1 - innerX0)); return 0; }
             if (inSlider(ySens)) { gActiveSlider = 2; slider_apply(2, (float)(mx - innerX0) / (float)(innerX1 - innerX0)); return 0; }
@@ -955,7 +1098,6 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
             if (inSlider(yHigh)) { gActiveSlider = 6; slider_apply(6, (float)(mx - innerX0) / (float)(innerX1 - innerX0)); return 0; }
             if (inSlider(yAir)) { gActiveSlider = 7; slider_apply(7, (float)(mx - innerX0) / (float)(innerX1 - innerX0)); return 0; }
 
-            // 3) Sphere drag (inside sphere radius)
             {
                 float cx = gSpherePosX * ww;
                 float cy = gSpherePosY * hh;
@@ -970,8 +1112,6 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
                     return 0;
                 }
             }
-
-            // Click on dim background: no-op
             return 0;
         }
         break;
@@ -1009,9 +1149,14 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
             gDraggingPanel = false;
             gDraggingSphere = false;
             ReleaseCapture();
+
+            // Persist changes after any drag
+            save_settings_file();
+
             return 0;
         }
         break;
+
 
     case WM_SIZE: {
         int ww = LOWORD(lParam);
@@ -1030,11 +1175,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
     default:
         return DefWindowProcW(h, m, wParam, lParam);
     }
+    return DefWindowProcW(h, m, wParam, lParam);
 }
 
 /* ===== Entry / main loop ===== */
 int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
-    // DPI awareness
     using SetProcessDpiAwarenessContext_t = BOOL(WINAPI*)(HANDLE);
     if (auto setCtx = (SetProcessDpiAwarenessContext_t)
         GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext"))
@@ -1042,7 +1187,6 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         setCtx((HANDLE)-4); // PER_MONITOR_AWARE_V2
     }
 
-    // Class
     WNDCLASSW wc{};
     wc.hInstance = inst;
     wc.lpfnWndProc = WndProc;
@@ -1051,7 +1195,6 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     wc.hbrBackground = nullptr;
     RegisterClassW(&wc);
 
-    // Fullscreen overlay
     int screenW = GetSystemMetrics(SM_CXSCREEN);
     int screenH = GetSystemMetrics(SM_CYSCREEN);
 
@@ -1067,13 +1210,18 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     ShowWindow(h, SW_SHOWNA);
     UpdateWindow(h);
 
-    // Hotkeys
-    RegisterHotKey(h, HK_TOGGLE_VIS, MOD_ALT | MOD_NOREPEAT, 'H'); // Alt+H
-    RegisterHotKey(h, HK_TOGGLE_CFG, MOD_ALT | MOD_NOREPEAT, 'I'); // Alt+I
+    RegisterHotKey(h, HK_TOGGLE_VIS, MOD_ALT | MOD_NOREPEAT, 'H');
+    RegisterHotKey(h, HK_TOGGLE_CFG, MOD_ALT | MOD_NOREPEAT, 'I');
 
     g_dib = make_dib(screenW, screenH);
     gPanelX = 40;
     gPanelY = 40;
+
+    // One-time guidance for best accuracy
+    show_first_run_guidance(h);
+
+    // Load previous user settings (if any)
+    load_settings_file();
 
     audio_init();
 
@@ -1117,19 +1265,63 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
             DispatchMessageW(&msg);
         }
 
-        float t = std::chrono::duration<float>(
-            std::chrono::steady_clock::now() - t0).count();
+        float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - t0).count();
         float dt = t - tPrev;
         tPrev = t;
+        dt = std::clamp(dt, 0.001f, 0.050f);
 
-        // Read energies
-        float EL[NB], ER[NB];
+        // Read raw energies
+        float ELr[NB], ERr[NB];
         for (int b = 0; b < NB; ++b) {
-            EL[b] = gEL[b].load(std::memory_order_relaxed);
-            ER[b] = gER[b].load(std::memory_order_relaxed);
+            ELr[b] = gEL[b].load(std::memory_order_relaxed);
+            ERr[b] = gER[b].load(std::memory_order_relaxed);
         }
 
-        // Pinna / elevation / rear estimate (same idea as before)
+        // === Auto noise-floor tracking + auto gain (install & done) ===
+        float EL[NB], ER[NB];
+        float tot = 0.0f;
+
+        for (int b = 0; b < NB; ++b) {
+            float l = ELr[b], r = ERr[b];
+
+            // floor update (asymmetric attack/release)
+            float dl = l - gFloorL[b];
+            float dr = r - gFloorR[b];
+            gFloorL[b] += (dl > 0 ? FLOOR_ATTACK : FLOOR_RELEASE) * dl;
+            gFloorR[b] += (dr > 0 ? FLOOR_ATTACK : FLOOR_RELEASE) * dr;
+
+            // subtract floor (clamp)
+            float l2 = std::max(0.0f, l - FLOOR_MULT * gFloorL[b]);
+            float r2 = std::max(0.0f, r - FLOOR_MULT * gFloorR[b]);
+
+            // apply auto gain (global) later, after we compute it from tot
+            EL[b] = l2;
+            ER[b] = r2;
+
+            tot += (l2 + r2);
+        }
+
+        // normalize tot into a “human” scale and update auto gain toward target
+        // (log keeps it stable across devices)
+        float totN = std::log1p(std::max(0.0f, tot));
+        float err = (TARGET_LEVEL - totN);
+        gAutoGain = std::clamp(gAutoGain + AUTO_GAIN_RATE * err, 0.40f, 4.50f);
+
+        for (int b = 0; b < NB; ++b) {
+            EL[b] *= gAutoGain;
+            ER[b] *= gAutoGain;
+        }
+
+        // === Transient detector (favor shots/steps over ambience) ===
+        float totNow = 0.0f;
+        for (int b = 0; b < NB; ++b) totNow += (EL[b] + ER[b]);
+        float totNowN = std::log1p(std::max(0.0f, totNow));
+        float dTot = std::max(0.0f, totNowN - gPrevTot);
+        gPrevTot = totNowN;
+        gTransient = ema(gTransient, dTot, TRANSIENT_ALPHA);
+        float transientBoost = std::clamp(gTransient / TRANSIENT_HI, 0.0f, 1.0f);
+
+        // === Pinna / elevation / rear estimate (same idea, but later used with confidence gating) ===
         auto L1p = [](float v) { return std::log1p(std::max(0.f, v)); };
         const float Ww[NB] = { 0.0f, 0.2f, 0.6f, 1.0f, 0.9f, 0.2f };
 
@@ -1146,6 +1338,8 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
             float elevB = std::clamp(0.5f * ((R812 - R58) + (L812 - L58)), -1.f, 1.f);
             float notchL = L58 - 0.5f * (L25 + L812);
             float notchR = R58 - 0.5f * (R25 + R812);
+
+            // rearB is still heuristic; keep it conservative via later gating
             float rearB = std::clamp(0.5f * (notchL + notchR), 0.f, 1.f);
             float frontB = std::clamp(1.f - rearB, 0.f, 1.f);
 
@@ -1163,7 +1357,7 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         float backScore = std::clamp(backInst / denom, 0.f, 1.f);
         float frontScore = std::clamp(frontInst / denom, 0.f, 1.f);
 
-        // Decay peaks
+        // === Decay peaks ===
         for (auto& p : g_peaks) if (p.life > 0.f) {
             p.life -= dt;
             p.amp *= std::exp(-dt * PEAK_DECAY_HZ);
@@ -1172,120 +1366,153 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
 
         const float maxAng = MAX_AZIMUTH_DEG * PI_F / 180.f;
 
-        // Build peaks from band energies
+        // === Build peaks from band energies with confidence gating ===
+        auto norm = [](float v) { return std::tanh(1.2f * v); };
+
+        // small helper to compute “direction confidence” from ILD-like imbalance
+        auto dir_conf = [](float L, float R) {
+            float S = L + R + 1e-6f;
+            float ild = std::fabs((R - L) / S);
+            // Map into [0..1], conservative
+            return std::clamp((ild - 0.08f) / 0.35f, 0.0f, 1.0f);
+            };
+
         for (int b = 0; b < NB; ++b) {
             float L = EL[b];
             float R = ER[b];
             float S = L + R;
             if (S <= 1e-6f) continue;
 
-            float ild = (gSwapLR ? (L - R) : (R - L)) / S; // + = right
-            ild = std::clamp(ild, -1.f, 1.f);
-            (void)ild;
+            // Swap if requested (affects left/right reading)
+            float Ls = gSwapLR ? R : L;
+            float Rs = gSwapLR ? L : R;
 
-            float center = std::min(L, R);
-            float left = std::max(0.f, L - R);
-            float right = std::max(0.f, R - L);
+            float center = std::min(Ls, Rs);
+            float left = std::max(0.f, Ls - Rs);
+            float right = std::max(0.f, Rs - Ls);
 
-            auto norm = [](float v) { return std::tanh(1.2f * v); };
+            // Confidence: transients make direction more trustworthy
+            float cDir = dir_conf(Ls, Rs);
+            float cEvent = std::clamp(0.25f + 0.75f * transientBoost, 0.25f, 1.0f);
+            float c = std::clamp(0.55f * cDir + 0.45f * cEvent, 0.0f, 1.0f);
 
-            // Front: shared energy, but damped if strong rear cue
+            // Elevation only when |elev| strong, and better on transients
+            float elevMag = std::fabs(elevScore);
+            float elevConf = std::clamp((elevMag - ELEV_MIN_MAG) / (1.0f - ELEV_MIN_MAG), 0.0f, 1.0f);
+            elevConf = std::clamp(elevConf + transientBoost * ELEV_TRANSIENT_BOOST, 0.0f, 1.0f);
+            float elevFactor = 1.0f + elevScore * ELEV_SCALE * elevConf; // fades to 1 when not confident
+
+            // Rear only when strongly suggested AND on meaningful events
+            float backB = gBackB[b];
+            float rearConf = std::clamp((backB - REAR_MIN_CONF) / (1.0f - REAR_MIN_CONF), 0.0f, 1.0f);
+            // rear is *harder* than direction: require both rear signal and event confidence
+            rearConf = std::min(rearConf, std::clamp((transientBoost + cDir) * 0.55f, 0.0f, 1.0f));
+
+            // FRONT (always allowed, but damped if rear seems strong)
             {
                 float a = norm(center);
                 if (a > 0.01f) {
                     float rearDom = std::clamp(backScore - frontScore, 0.f, 1.f);
-                    a *= (1.0f - 0.25f * rearDom);
+                    // if rear is “maybe”, do NOT flip — just reduce confidence slightly
+                    a *= (1.0f - 0.20f * rearDom);
+
                     Peak q;
                     q.ang = 0.f;
-                    q.amp = a;
-                    q.life = 0.50f;
+                    q.amp = a * (0.65f + 0.35f * c);     // show stronger when confident
+                    q.life = 0.42f + 0.18f * transientBoost;
                     q.band = b;
-                    q.rearGain = gBackB[b];
-                    q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
-                    add_peak_merge(q);
-                }
-            }
-            // Left continuous
-            {
-                float a = norm(left);
-                if (a > 0.01f) {
-                    float frac = (L > 0.f ? left / std::max(L, 1e-6f) : 0.f);
-                    float ang = -maxAng * std::clamp(0.35f + 0.65f * frac, 0.f, 1.f);
-                    Peak q;
-                    q.ang = ang;
-                    q.amp = a;
-                    q.life = 0.55f;
-                    q.band = b;
-                    q.rearGain = gBackB[b];
-                    q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
-                    add_peak_merge(q);
-                }
-            }
-            // Right continuous
-            {
-                float a = norm(right);
-                if (a > 0.01f) {
-                    float frac = (R > 0.f ? right / std::max(R, 1e-6f) : 0.f);
-                    float ang = +maxAng * std::clamp(0.35f + 0.65f * frac, 0.f, 1.f);
-                    Peak q;
-                    q.ang = ang;
-                    q.amp = a;
-                    q.life = 0.55f;
-                    q.band = b;
-                    q.rearGain = gBackB[b];
-                    q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
+                    q.rearGain = backB * rearConf;       // only tint rear accent if rear confident
+                    q.elevFactor = elevFactor;
                     add_peak_merge(q);
                 }
             }
 
-            // Rear mirrors when pinna says "back"
-            float backB = gBackB[b];
-            if (backB > 0.10f) {
-                float rearScale = std::clamp(backB, 0.10f, 1.0f);
+            // LEFT / RIGHT (only show strong direction when confidence exists)
+            // If c is low, keep it closer to front to avoid “lying”.
+            auto ang_from_frac = [&](float frac, bool isRight) {
+                frac = std::clamp(frac, 0.f, 1.f);
+                float base = 0.18f; // minimum spread (keeps subtle cues near front)
+                float spread = base + (1.0f - base) * c; // widen with confidence
+                float ang = maxAng * (0.25f + 0.75f * frac) * spread;
+                return isRight ? +ang : -ang;
+                };
+
+            if (left > 0.f) {
+                float a = norm(left);
+                if (a > 0.01f) {
+                    float frac = left / std::max(Ls, 1e-6f);
+                    Peak q;
+                    q.ang = ang_from_frac(frac, false);
+                    q.amp = a * (0.60f + 0.40f * c);
+                    q.life = 0.46f + 0.18f * transientBoost;
+                    q.band = b;
+                    q.rearGain = backB * rearConf;
+                    q.elevFactor = elevFactor;
+                    add_peak_merge(q);
+                }
+            }
+
+            if (right > 0.f) {
+                float a = norm(right);
+                if (a > 0.01f) {
+                    float frac = right / std::max(Rs, 1e-6f);
+                    Peak q;
+                    q.ang = ang_from_frac(frac, true);
+                    q.amp = a * (0.60f + 0.40f * c);
+                    q.life = 0.46f + 0.18f * transientBoost;
+                    q.band = b;
+                    q.rearGain = backB * rearConf;
+                    q.elevFactor = elevFactor;
+                    add_peak_merge(q);
+                }
+            }
+
+            // REAR mirrors (only when rear confidence is high)
+            if (backB > REAR_HI_CONF && rearConf > 0.10f) {
+                float rearScale = std::clamp(rearConf, 0.0f, 1.0f);
 
                 // Rear center
                 {
-                    float a = norm(center) * rearScale * 0.85f;
+                    float a = norm(center) * rearScale * 0.80f;
                     if (a > 0.01f) {
                         Peak q;
                         q.ang = PI_F;
                         q.amp = a;
-                        q.life = 0.45f;
+                        q.life = 0.33f + 0.12f * transientBoost; // rear fades faster
                         q.band = b;
                         q.rearGain = backB;
-                        q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
+                        q.elevFactor = elevFactor;
                         add_peak_merge(q);
                     }
                 }
-                // Rear left
+                // Rear left/right mirror
                 if (left > 0.f) {
-                    float frac = (L > 0.f ? left / std::max(L, 1e-6f) : 0.f);
-                    float angL = -maxAng * std::clamp(0.35f + 0.65f * frac, 0.f, 1.f);
-                    float a = norm(left) * rearScale * 0.75f;
+                    float frac = left / std::max(Ls, 1e-6f);
+                    float angL = ang_from_frac(frac, false);
+                    float a = norm(left) * rearScale * 0.70f;
                     if (a > 0.01f) {
                         Peak q;
                         q.ang = std::remainder(angL + PI_F, 2 * PI_F);
                         q.amp = a;
-                        q.life = 0.45f;
+                        q.life = 0.33f + 0.12f * transientBoost;
                         q.band = b;
                         q.rearGain = backB;
-                        q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
+                        q.elevFactor = elevFactor;
                         add_peak_merge(q);
                     }
                 }
-                // Rear right
                 if (right > 0.f) {
-                    float frac = (R > 0.f ? right / std::max(R, 1e-6f) : 0.f);
-                    float angR = +maxAng * std::clamp(0.35f + 0.65f * frac, 0.f, 1.f);
-                    float a = norm(right) * rearScale * 0.75f;
+                    float frac = right / std::max(Rs, 1e-6f);
+                    float angR = ang_from_frac(frac, true);
+                    float a = norm(right) * rearScale * 0.70f;
                     if (a > 0.01f) {
                         Peak q;
                         q.ang = std::remainder(angR + PI_F, 2 * PI_F);
                         q.amp = a;
-                        q.life = 0.45f;
+                        q.life = 0.33f + 0.12f * transientBoost;
                         q.band = b;
                         q.rearGain = backB;
-                        q.elevFactor = 1.0f + elevScore * ELEV_SCALE;
+                        q.elevFactor = elevFactor;
                         add_peak_merge(q);
                     }
                 }
