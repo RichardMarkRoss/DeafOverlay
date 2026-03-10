@@ -49,15 +49,16 @@
 
 /* ===== Base tunables ===== */
 static constexpr float BASE_SENS_GAIN = 0.95f;
-static constexpr float MAX_AZIMUTH_DEG = 78.0f;   // per-side span on ring
-static constexpr float PEAK_DECAY_HZ = 1.7f;
+static constexpr float MAX_AZIMUTH_DEG = 90.0f;   // per-side span on ring (full quarter turn)
+static constexpr float PEAK_DECAY_HZ = 1.0f;      // slower fade = more visible
 static constexpr float ELEV_SCALE = 0.30f;
 static constexpr float REAR_SCALE = 1.00f;
+static constexpr float ILD_K = 2.5f;              // ILD→angle curve steepness
 
 /* ===== Accuracy-first tunables (new) ===== */
 static constexpr float FLOOR_ATTACK = 0.0035f;  // how fast noise floor rises
 static constexpr float FLOOR_RELEASE = 0.0008f;  // how fast noise floor falls
-static constexpr float FLOOR_MULT = 1.25f;    // subtract floor*mult from energy
+static constexpr float FLOOR_MULT = 1.05f;    // subtract floor*mult from energy (was 1.25, less aggressive)
 static constexpr float AUTO_GAIN_RATE = 0.015f;   // how fast auto gain adapts
 static constexpr float TARGET_LEVEL = 0.24f;    // target normalized “activity” for easy visibility
 
@@ -531,8 +532,9 @@ void MA_API audio_cb(ma_device* dev, void*, const void* pIn, ma_uint32 frames) {
         a12k = a_fc(12000.f);
     const float aTot = 0.07f;
 
-    float lp250L = 0, lp2kL = 0, lp5kL = 0, lp8kL = 0, lp12kL = 0, totL = 0;
-    float lp250R = 0, lp2kR = 0, lp5kR = 0, lp8kR = 0, lp12kR = 0, totR = 0;
+    // Static: state persists across callback calls for true continuous IIR filtering
+    static float lp250L = 0, lp2kL = 0, lp5kL = 0, lp8kL = 0, lp12kL = 0, totL = 0;
+    static float lp250R = 0, lp2kR = 0, lp5kR = 0, lp8kR = 0, lp12kR = 0, totR = 0;
 
     for (ma_uint32 i = 0; i < frames; ++i) {
         float L = s[i * ch + 0];
@@ -646,7 +648,7 @@ static void draw_ring(void* bits, int w, int h, float cx, float cy, float a, flo
 
             for (const auto& p : g_peaks) if (p.life > 0.f) {
                 float dist = std::fabs(std::remainder(ang - p.ang, 2 * PI_F));
-                float hot = std::max(0.f, 1.f - dist / 0.9f);
+                float hot = std::max(0.f, 1.f - dist / 0.60f);  // ~34° spread: precise but visible
                 float win = (1.f - std::cosf(hot * PI_F)) * 0.5f;
                 float gg = win * p.amp;
                 if (gg > bestGlow) { bestGlow = gg; bestAmp = p.amp; }
@@ -1392,8 +1394,8 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         auto dir_conf = [](float L, float R) {
             float S = L + R + 1e-6f;
             float ild = std::fabs((R - L) / S);
-            // Map into [0..1], conservative
-            return std::clamp((ild - 0.08f) / 0.35f, 0.0f, 1.0f);
+            // Lowered dead zone: 0.02 (was 0.08) so subtle stereo differences register
+            return std::clamp((ild - 0.02f) / 0.28f, 0.0f, 1.0f);
             };
 
         for (int b = 0; b < NB; ++b) {
@@ -1406,10 +1408,6 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
             float Ls = gSwapLR ? R : L;
             float Rs = gSwapLR ? L : R;
 
-            float center = std::min(Ls, Rs);
-            float left = std::max(0.f, Ls - Rs);
-            float right = std::max(0.f, Rs - Ls);
-
             // Confidence: transients make direction more trustworthy
             float cDir = dir_conf(Ls, Rs);
             float cEvent = std::clamp(0.25f + 0.75f * transientBoost, 0.25f, 1.0f);
@@ -1419,51 +1417,31 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
             float elevMag = std::fabs(elevScore);
             float elevConf = std::clamp((elevMag - ELEV_MIN_MAG) / (1.0f - ELEV_MIN_MAG), 0.0f, 1.0f);
             elevConf = std::clamp(elevConf + transientBoost * ELEV_TRANSIENT_BOOST, 0.0f, 1.0f);
-            float elevFactor = 1.0f + elevScore * ELEV_SCALE * elevConf; // fades to 1 when not confident
+            float elevFactor = 1.0f + elevScore * ELEV_SCALE * elevConf;
 
             // Rear only when strongly suggested AND on meaningful events
             float backB = gBackB[b];
             float rearConf = std::clamp((backB - REAR_MIN_CONF) / (1.0f - REAR_MIN_CONF), 0.0f, 1.0f);
-            // rear is *harder* than direction: require both rear signal and event confidence
             rearConf = std::min(rearConf, std::clamp((transientBoost + cDir) * 0.55f, 0.0f, 1.0f));
 
-            // FRONT (always allowed, but damped if rear seems strong)
+            // ILD-based azimuth: signed [-1,1], positive = right, negative = left
+            // tanh curve gives natural spread: quiet difference → small angle, hard pan → near maxAng
+            float ild_signed = (Rs - Ls) / (Rs + Ls + 1e-6f);
+            float ang_ild = maxAng * std::tanh(ILD_K * ild_signed);  // maxAng already in radians
+
+            // Directional peak: amplitude from dominant channel (what the listener hears as loudest).
+            // norm(max(Ls,Rs)) matches the old norm(left) magnitude for strong pans, and norm(L)
+            // for mono — keeps quiet footsteps and ambient cues visible.
             {
-                float a = norm(center);
-                if (a > 0.01f) {
+                float a = norm(std::max(Ls, Rs));
+                if (a > 0.005f) {
                     float rearDom = std::clamp(backScore - frontScore, 0.f, 1.f);
-                    // if rear is “maybe”, do NOT flip — just reduce confidence slightly
-                    a *= (1.0f - 0.20f * rearDom);
+                    a *= (1.0f - 0.18f * rearDom);
 
                     Peak q;
-                    q.ang = 0.f;
-                    q.amp = a * (0.65f + 0.35f * c);     // show stronger when confident
-                    q.life = 0.42f + 0.18f * transientBoost;
-                    q.band = b;
-                    q.rearGain = backB * rearConf;       // only tint rear accent if rear confident
-                    q.elevFactor = elevFactor;
-                    add_peak_merge(q);
-                }
-            }
-
-            // LEFT / RIGHT (only show strong direction when confidence exists)
-            // If c is low, keep it closer to front to avoid “lying”.
-            auto ang_from_frac = [&](float frac, bool isRight) {
-                frac = std::clamp(frac, 0.f, 1.f);
-                float base = 0.18f; // minimum spread (keeps subtle cues near front)
-                float spread = base + (1.0f - base) * c; // widen with confidence
-                float ang = maxAng * (0.25f + 0.75f * frac) * spread;
-                return isRight ? +ang : -ang;
-                };
-
-            if (left > 0.f) {
-                float a = norm(left);
-                if (a > 0.01f) {
-                    float frac = left / std::max(Ls, 1e-6f);
-                    Peak q;
-                    q.ang = ang_from_frac(frac, false);
-                    q.amp = a * (0.60f + 0.40f * c);
-                    q.life = 0.46f + 0.18f * transientBoost;
+                    q.ang = ang_ild;
+                    q.amp = a * (0.62f + 0.38f * c);
+                    q.life = 0.55f + 0.22f * transientBoost;
                     q.band = b;
                     q.rearGain = backB * rearConf;
                     q.elevFactor = elevFactor;
@@ -1471,69 +1449,19 @@ int APIENTRY wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
                 }
             }
 
-            if (right > 0.f) {
-                float a = norm(right);
-                if (a > 0.01f) {
-                    float frac = right / std::max(Rs, 1e-6f);
-                    Peak q;
-                    q.ang = ang_from_frac(frac, true);
-                    q.amp = a * (0.60f + 0.40f * c);
-                    q.life = 0.46f + 0.18f * transientBoost;
-                    q.band = b;
-                    q.rearGain = backB * rearConf;
-                    q.elevFactor = elevFactor;
-                    add_peak_merge(q);
-                }
-            }
-
-            // REAR mirrors (only when rear confidence is high)
+            // REAR mirror (only when rear confidence is high)
             if (backB > REAR_HI_CONF && rearConf > 0.10f) {
                 float rearScale = std::clamp(rearConf, 0.0f, 1.0f);
-
-                // Rear center
-                {
-                    float a = norm(center) * rearScale * 0.80f;
-                    if (a > 0.01f) {
-                        Peak q;
-                        q.ang = PI_F;
-                        q.amp = a;
-                        q.life = 0.33f + 0.12f * transientBoost; // rear fades faster
-                        q.band = b;
-                        q.rearGain = backB;
-                        q.elevFactor = elevFactor;
-                        add_peak_merge(q);
-                    }
-                }
-                // Rear left/right mirror
-                if (left > 0.f) {
-                    float frac = left / std::max(Ls, 1e-6f);
-                    float angL = ang_from_frac(frac, false);
-                    float a = norm(left) * rearScale * 0.70f;
-                    if (a > 0.01f) {
-                        Peak q;
-                        q.ang = std::remainder(angL + PI_F, 2 * PI_F);
-                        q.amp = a;
-                        q.life = 0.33f + 0.12f * transientBoost;
-                        q.band = b;
-                        q.rearGain = backB;
-                        q.elevFactor = elevFactor;
-                        add_peak_merge(q);
-                    }
-                }
-                if (right > 0.f) {
-                    float frac = right / std::max(Rs, 1e-6f);
-                    float angR = ang_from_frac(frac, true);
-                    float a = norm(right) * rearScale * 0.70f;
-                    if (a > 0.01f) {
-                        Peak q;
-                        q.ang = std::remainder(angR + PI_F, 2 * PI_F);
-                        q.amp = a;
-                        q.life = 0.33f + 0.12f * transientBoost;
-                        q.band = b;
-                        q.rearGain = backB;
-                        q.elevFactor = elevFactor;
-                        add_peak_merge(q);
-                    }
+                float a = norm(std::max(Ls, Rs)) * rearScale * 0.75f;
+                if (a > 0.01f) {
+                    Peak q;
+                    q.ang = std::remainder(ang_ild + PI_F, 2 * PI_F);
+                    q.amp = a;
+                    q.life = 0.35f + 0.12f * transientBoost;
+                    q.band = b;
+                    q.rearGain = backB;
+                    q.elevFactor = elevFactor;
+                    add_peak_merge(q);
                 }
             }
         }
