@@ -49,3 +49,24 @@ fn band_gains_weight_their_band() {
     let muted = strength([0.0, 0.0, 1.0, 1.0, 1.0, 1.0]);
     assert!(full > 0.0 && muted < 0.2 * full, "full {full}, muted {muted}");
 }
+
+#[test]
+fn front_back_guess_never_puts_front_sounds_behind() {
+    // With no HRTF pinna cues (plain panning, or the simple spherical-head render), the guess must
+    // leave everything on the front arc. A wrong "behind" is the failure that matters here.
+    for az in [-80.0, -45.0, -15.0, 0.0, 20.0, 50.0, 80.0] {
+        for (name, sig) in [
+            ("panned", synth::pan_stereo(&synth::colored_bursts(48_000, eval::SR, az as u64 + 200), az)),
+            ("head model", synth::binaural(&synth::colored_bursts(48_000, eval::SR, az as u64 + 300), az, eval::SR)),
+        ] {
+            let mut a = Analyzer::new(&synth::STEREO, eval::SR);
+            a.front_back = true;
+            for chunk in sig.chunks(1024) {
+                a.process(chunk);
+                if let Some(s) = a.sources().iter().find(|s| s.azimuth.abs() > 90.0) {
+                    panic!("{name} source at {az} shown behind at {}", s.azimuth);
+                }
+            }
+        }
+    }
+}

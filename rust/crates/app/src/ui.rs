@@ -1,17 +1,18 @@
 //! Settings panel below the HUD: a port of v1 `draw_settings_panel` / `draw_setup_body` and the
-//! click handling in `WndProc`.
+//! click handling in `WndProc`, plus the HUD style and colour pickers.
 //!
 //! One layout function ([`panel`]) builds everything. With a canvas it draws; either way it returns
 //! the clickable widgets and the text to draw. v1 computed the geometry twice, in the draw code
 //! and in the mouse handler, and the two had to be kept in step by hand.
 
-use crate::hud::{Canvas, Layout, HUD_AREA_H};
+use crate::gfx::Canvas;
+use crate::hud::{HudParams, HudStyle, PaletteKind};
 
 pub const PANEL_W: i32 = 360;
-pub const PANEL_H: i32 = 420;
-pub const PANEL_X: i32 = 10;
-pub const PANEL_TOP: i32 = HUD_AREA_H as i32 + 8;
-pub const WIN_H_SETTINGS: usize = (PANEL_TOP + PANEL_H + 14) as usize;
+pub const PANEL_H: i32 = 486;
+/// Space between the HUD and the panel, and below the panel.
+pub const PANEL_GAP: i32 = 8;
+pub const PANEL_BOTTOM: i32 = 14;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Preset {
@@ -24,17 +25,19 @@ pub enum Preset {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Settings {
-    pub layout: Layout,
+    pub hud: HudParams,
     pub sensitivity: f32, // 0.5 .. 2.0
     /// 0-250 Hz, 250-2k, 2-5k, 5-8k, 8-12k, 12k+; each 0 .. 3, 1 = neutral.
     pub band_gain: [f32; 6],
     pub swap_lr: bool,
+    /// Stereo HRTF front/back guess (experimental, off by default).
+    pub front_back: bool,
     pub preset: Preset,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { layout: Layout::default(), sensitivity: 1.0, band_gain: [1.0; 6], swap_lr: false, preset: Preset::None }
+        Self { hud: HudParams::default(), sensitivity: 1.0, band_gain: [1.0; 6], swap_lr: false, front_back: false, preset: Preset::None }
     }
 }
 
@@ -54,18 +57,18 @@ impl Settings {
 
     /// v1 `set_preset_exclusive`: clicking the active preset unticks it (values stay).
     pub fn toggle_preset(&mut self, p: Preset) {
-        if self.preset == p {
+        if self.preset == p || p == Preset::None {
             self.preset = Preset::None;
         } else {
             self.apply_preset(p);
         }
     }
 
-    /// Slider position 0..1 (v1 `slider_t_from_value`). 0 sphere, 1 ring, 2 sensitivity, 3.. bands.
+    /// Slider position 0..1. 0 size, 1 opacity, 2 sensitivity, 3.. bands.
     pub fn slider(&self, i: usize) -> f32 {
         let t = match i {
-            0 => (self.layout.sphere_scale - 0.6) / 1.0,
-            1 => (self.layout.ring_offset_y - 0.40) / 0.50,
+            0 => (self.hud.scale - 0.6) / 1.0,
+            1 => (self.hud.opacity - 0.3) / 0.7,
             2 => (self.sensitivity - 0.5) / 1.5,
             _ => {
                 // Bands: left half 0..1, right half 1..3, so neutral sits in the middle.
@@ -76,20 +79,21 @@ impl Settings {
         t.clamp(0.0, 1.0)
     }
 
-    /// v1 `slider_apply`.
     pub fn set_slider(&mut self, i: usize, t: f32) {
         let t = t.clamp(0.0, 1.0);
         match i {
-            0 => self.layout.sphere_scale = 0.6 + t,
-            1 => self.layout.ring_offset_y = 0.40 + 0.50 * t,
+            0 => self.hud.scale = 0.6 + t,
+            1 => self.hud.opacity = 0.3 + 0.7 * t,
             2 => self.sensitivity = 0.5 + 1.5 * t,
             _ => self.band_gain[i - 3] = if t <= 0.5 { 2.0 * t } else { 1.0 + 4.0 * (t - 0.5) },
         }
     }
 }
 
-const INFO_SPHERE: &str = "Sphere size:\nAdjust how large the 3D cue appears.\nSmaller = subtle, larger = easier to see peripheral threats.";
-const INFO_RING: &str = "Ring vertical position:\nMove the horizontal ring up/down.\nPlace it near your crosshair/focus area for faster reading.";
+const INFO_STYLE: &str = "HUD style:\nOrbit: a 3D orb over a compass ring.\nRadar: a top-down disc; or thin arcs around your crosshair.\nTape: a thin 360° compass strip; front in the middle, behind at both ends.\nAll three show the same sounds; pick what reads fastest for you.";
+const INFO_COLOURS: &str = "Colours:\nBrand: amber for front, blue for behind.\nColour-blind: orange and sky blue, distinct for common colour-vision deficiencies.\nHigh contrast: yellow and white on a darker backing.\nFront and behind are also shown by shape, never by colour alone.";
+const INFO_SIZE: &str = "Size:\nHow large the HUD is. The window grows or shrinks around its centre.";
+const INFO_OPACITY: &str = "Opacity:\nHow see-through the whole HUD is.";
 const INFO_SENS: &str = "Global sensitivity:\nControls how strongly all sounds light up.\nLower = only louder/closer sounds.\nHigher = includes quiet cues like footsteps and reloads.";
 const INFO_BASS: &str = "Bass (0–250 Hz):\nFootsteps thuds, rumbles, explosions, distant booms.\nIncrease to see low movement.\nReduce if constant rumble is too noisy.";
 const INFO_LOWMID: &str = "Low-Mid (250–2 kHz):\nBody of gunshots, doors, movement, voices.\nGood for tracking nearby players.";
@@ -97,13 +101,17 @@ const INFO_MID: &str = "Mid (2–5 kHz):\nClarity of gunshots, glass, impacts, v
 const INFO_HIGHMID: &str = "High-Mid (5–8 kHz):\nSharp details: metallic pings, shell drops, some footsteps.\nHelps separate close threats from background.";
 const INFO_AIR: &str = "Treble / Air (8 kHz+):\nVery high details: hiss, sparks, UI beeps.\nTurn up to catch subtle directional cues, down if too busy.";
 const INFO_SWAP: &str = "Swap L/R:\nFlip left and right.\nUse if your headset or game output feels reversed.";
+const INFO_FB: &str = "Guess front/back (experimental):
+With stereo output, some games render 3D audio for headphones (HRTF).
+This tries to tell sounds behind you from sounds in front by how the ear shapes them.
+It only shows 'behind' when it is confident, so many rear sounds still appear in front.
+No effect on plain stereo, 5.1 or 7.1 (7.1 already shows true 360).";
 const INFO_PRESET: &str = "Game presets:\nOne-click tuning for common games.\nThese adjust sensitivity + band gains to make key cues easier to see.\nYou can still fine-tune sliders after selecting.";
 
-/// Label and info text per slider, in slider-index order. (v1 draws 8; band 5, 12k+, is
-/// preset-only.)
+/// Label and info text per slider, in slider-index order. (Band 5, 12k+, is preset-only.)
 const SLIDERS: [(&str, &str); 8] = [
-    ("Sphere size", INFO_SPHERE),
-    ("Ring vertical position", INFO_RING),
+    ("Size", INFO_SIZE),
+    ("Opacity", INFO_OPACITY),
     ("Global sensitivity", INFO_SENS),
     ("Bass (0-250 Hz)", INFO_BASS),
     ("Low-Mid (250-2k)", INFO_LOWMID),
@@ -122,7 +130,11 @@ pub enum View {
 pub enum Action {
     Info(&'static str),
     Slider(usize),
+    Style(HudStyle),
+    Crosshair,
+    Palette(PaletteKind),
     SwapLr,
+    FrontBack,
     Preset(Preset),
     OpenSoundSettings,
     OpenSpatialSettings,
@@ -198,6 +210,7 @@ const GREEN: (u8, u8, u8) = (120, 230, 120);
 const RED: (u8, u8, u8) = (240, 120, 120);
 const YELLOW: (u8, u8, u8) = (240, 220, 90);
 const GREY: (u8, u8, u8) = (225, 225, 225);
+const DIM: (u8, u8, u8) = (170, 170, 185);
 
 impl Builder<'_, '_> {
     #[allow(clippy::too_many_arguments)]
@@ -280,14 +293,22 @@ impl Builder<'_, '_> {
         self.texts.push(Text { x, y, s: label.into(), rgb: WHITE, center_in: Some((x, y, x + w, y + h)) });
         self.widget(x, y, x + w, y + h, action);
     }
+
+    /// A row of equal buttons, one of them selected.
+    fn segmented(&mut self, x0: i32, y: i32, x1: i32, items: &[(&str, Action, bool)]) {
+        let n = items.len() as i32;
+        let w = (x1 - x0 - 4 * (n - 1)) / n;
+        for (i, (label, action, on)) in items.iter().enumerate() {
+            self.button(x0 + i as i32 * (w + 4), y, w, 22, label, *action, *on);
+        }
+    }
 }
 
-/// Lay out (and, given a canvas, draw) the settings panel.
-pub fn panel(c: Option<&mut Canvas>, view: View, s: &Settings, info: &SetupInfo) -> Panel {
+/// Lay out (and, given a canvas, draw) the settings panel with its top-left at `(x0, y0)`.
+pub fn panel(c: Option<&mut Canvas>, (x0, y0): (i32, i32), view: View, s: &Settings, info: &SetupInfo) -> Panel {
     let mut b = Builder { c, widgets: Vec::new(), texts: Vec::new() };
-    let (x0, y0) = (PANEL_X, PANEL_TOP);
     let (x1, y1) = (x0 + PANEL_W, y0 + PANEL_H);
-    b.rect(x0, y0, x1, y1, 205, 16, 16, 20);
+    b.rect(x0, y0, x1, y1, 232, 16, 16, 20); // opaque enough that the game behind doesn't show through the text
     b.rect(x0, y0, x1, y0 + 24, 235, 32, 32, 40);
     let (ix0, ix1) = (x0 + 12, x1 - 32);
     let info_x = x1 - 14;
@@ -299,37 +320,63 @@ pub fn panel(c: Option<&mut Canvas>, view: View, s: &Settings, info: &SetupInfo)
         }
         View::Controls => {
             b.text(x0 + 10, y0 + 5, "DeafOverlay Settings", CREAM);
-            let mut y = y0 + 40;
+            let hud = s.hud;
+            let mut y = y0 + 32;
+            b.text(ix0, y, "HUD style", CREAM);
+            b.info_icon(info_x, y + 6, INFO_STYLE);
+            y += 16;
+            b.segmented(ix0, y, ix1, &[
+                ("Orbit", Action::Style(HudStyle::Orbit), hud.style == HudStyle::Orbit),
+                ("Radar", Action::Style(HudStyle::Radar), hud.style == HudStyle::Radar),
+                ("Compass tape", Action::Style(HudStyle::Tape), hud.style == HudStyle::Tape),
+            ]);
+            y += 28;
+            if hud.style == HudStyle::Radar {
+                b.checkbox(ix0, y, hud.crosshair);
+                b.text(ix0 + 18, y - 1, "Crosshair mode (arcs around your aim)", CREAM);
+                b.widget(ix0, y - 4, ix1, y + 16, Action::Crosshair);
+            }
+            y += 20;
+            b.text(ix0, y, "Colours", CREAM);
+            b.info_icon(info_x, y + 6, INFO_COLOURS);
+            y += 16;
+            b.segmented(ix0, y, ix1, &[
+                ("Brand", Action::Palette(PaletteKind::Brand), hud.palette == PaletteKind::Brand),
+                ("Colour-blind", Action::Palette(PaletteKind::ColorBlind), hud.palette == PaletteKind::ColorBlind),
+                ("High contrast", Action::Palette(PaletteKind::HighContrast), hud.palette == PaletteKind::HighContrast),
+            ]);
+            y += 46;
             for (i, (label, help)) in SLIDERS.iter().enumerate() {
                 b.slider(i, ix0, y, ix1, s.slider(i));
                 b.text(ix0, y - 14, *label, CREAM);
                 b.info_icon(info_x, y - 10, help);
                 y += 26;
             }
-            let y_air = y - 26;
-
-            let cb_y = y_air + 12;
+            let cb_y = y - 26 + 12;
             b.checkbox(ix0, cb_y, s.swap_lr);
             b.text(ix0 + 18, cb_y - 1, "Swap L/R", CREAM);
             b.info_icon(info_x, cb_y + 2, INFO_SWAP);
             b.widget(ix0, cb_y - 4, ix0 + 132, cb_y + 16, Action::SwapLr);
 
-            let pres_y = cb_y + 28;
-            b.text(ix0, pres_y - 2, "Game presets", CREAM);
-            b.info_icon(info_x, pres_y + 2, INFO_PRESET);
-            let row_y = pres_y + 18;
-            for (k, (p, name)) in
-                [(Preset::Cs2, "CS2"), (Preset::R6s, "Rainbow Six Siege"), (Preset::Cod, "Call of Duty")].into_iter().enumerate()
-            {
-                let by = row_y + 18 * k as i32;
-                b.checkbox(ix0, by, s.preset == p);
-                b.text(ix0 + 18, by - 1, name, CREAM);
-                b.widget(ix0, by - 4, ix0 + 240, by + 16, Action::Preset(p));
-            }
-            b.text(ix0, row_y + 58, "(Select one, then fine-tune sliders)", (220, 220, 220));
-            b.button(ix0, row_y + 76, ix1 - ix0, 22, "Setup / Help", Action::Show(View::Setup), false);
+            let fb_y = cb_y + 20;
+            b.checkbox(ix0, fb_y, s.front_back);
+            b.text(ix0 + 18, fb_y - 1, "Guess front/back (stereo 3D audio)", CREAM);
+            b.info_icon(info_x, fb_y + 2, INFO_FB);
+            b.widget(ix0, fb_y - 4, ix0 + 240, fb_y + 16, Action::FrontBack);
+
+            let pres_y = fb_y + 24;
+            b.text(ix0, pres_y, "Game preset", CREAM);
+            b.info_icon(info_x, pres_y + 6, INFO_PRESET);
+            b.segmented(ix0, pres_y + 16, ix1, &[
+                ("None", Action::Preset(Preset::None), s.preset == Preset::None),
+                ("CS2", Action::Preset(Preset::Cs2), s.preset == Preset::Cs2),
+                ("R6 Siege", Action::Preset(Preset::R6s), s.preset == Preset::R6s),
+                ("CoD", Action::Preset(Preset::Cod), s.preset == Preset::Cod),
+            ]);
+            b.button(ix0, pres_y + 44, ix1 - ix0, 22, "Setup / Help", Action::Show(View::Setup), false);
         }
     }
+    b.text(x0 + 10, y1 - 18, "Alt+H hide   Alt+I settings   Alt+G game only   Alt+Q quit", DIM);
     Panel { widgets: b.widgets, texts: b.texts }
 }
 
@@ -411,18 +458,26 @@ mod tests {
 
     #[test]
     fn every_control_is_clickable_where_it_is_drawn() {
-        let s = Settings::default();
         let info = SetupInfo { capture_ok: true, channels: 2, ..Default::default() };
-        for view in [View::Controls, View::Setup] {
-            let p = panel(None, view, &s, &info);
-            for w in &p.widgets {
-                let (x, y) = centre(&p, w.action);
-                assert_eq!(p.hit(x, y), Some(w.action), "{view:?}");
-                assert!(w.y1 <= PANEL_TOP + PANEL_H && w.x1 <= PANEL_X + PANEL_W, "{:?} outside the panel", w.action);
+        let origin = (10, 250);
+        for style in [HudStyle::Orbit, HudStyle::Radar, HudStyle::Tape] {
+            let mut s = Settings::default();
+            s.hud.style = style;
+            for view in [View::Controls, View::Setup] {
+                let p = panel(None, origin, view, &s, &info);
+                for w in &p.widgets {
+                    let (x, y) = centre(&p, w.action);
+                    assert_eq!(p.hit(x, y), Some(w.action), "{style:?} {view:?}");
+                    assert!(w.x0 >= origin.0 && w.x1 <= origin.0 + PANEL_W, "{:?} outside the panel", w.action);
+                    assert!(w.y0 >= origin.1 && w.y1 <= origin.1 + PANEL_H - 20, "{:?} outside the panel or over the footer", w.action);
+                }
             }
+            // The crosshair option only exists for Radar.
+            let p = panel(None, origin, View::Controls, &s, &info);
+            assert_eq!(p.widgets.iter().any(|w| w.action == Action::Crosshair), style == HudStyle::Radar);
         }
-        // Sliders only exist (and can only be hit) in the Controls view, like v1's !gShowSetup guard.
-        assert!(panel(None, View::Setup, &s, &info).slider_span(0).is_none());
+        let s = Settings::default();
+        assert!(panel(None, origin, View::Setup, &s, &info).slider_span(0).is_none());
     }
 
     #[test]
@@ -447,5 +502,8 @@ mod tests {
         assert_eq!((s.preset, s.band_gain[0]), (Preset::Cod, 1.10));
         s.toggle_preset(Preset::Cod);
         assert_eq!((s.preset, s.band_gain[0]), (Preset::None, 1.10));
+        s.toggle_preset(Preset::R6s);
+        s.toggle_preset(Preset::None);
+        assert_eq!(s.preset, Preset::None);
     }
 }

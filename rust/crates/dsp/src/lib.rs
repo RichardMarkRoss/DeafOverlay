@@ -8,6 +8,7 @@
 
 pub mod baseline;
 pub mod eval;
+pub mod frontback;
 pub mod synth;
 mod tracker;
 
@@ -40,6 +41,9 @@ const NOISE_DOWN: f32 = 0.2; // ...and drops fast
 const PEAK_MIN_SEP_DEG: f32 = 16.0;
 const MAX_PEAKS: usize = 4;
 const BAND_EDGES_HZ: [f32; 5] = [250.0, 2000.0, 5000.0, 8000.0, 12000.0];
+/// A voting bin feeds the front/back features of its nearest peak within this. Wide on purpose:
+/// an HRTF's ILD varies a lot across frequency, so one source's bins vote over a broad arc.
+const FB_ASSIGN_DEG: f32 = 90.0;
 const HEAD_RADIUS_M: f32 = 0.0875;
 const SPEED_OF_SOUND: f32 = 343.0;
 
@@ -66,6 +70,12 @@ enum Mode {
 
 pub struct Analyzer {
     pub swap_lr: bool,
+    /// Stereo only: guess front/back for HRTF ("headphone 3D") mixes, see [`frontback`].
+    pub front_back: bool,
+    fb_band: Vec<Option<usize>>,       // per bin: front/back feature band
+    fb_model: frontback::Model,
+    fb_votes: Vec<(usize, f32, f32)>, // this hop's voting bins in feature bands: (bin, az, weight)
+    obs: Vec<tracker::Obs>,
     band_w: Vec<f32>, // per-bin user weight from set_band_gains
     sr: f32,
     nch: usize,
@@ -125,6 +135,11 @@ impl Analyzer {
         };
         Self {
             swap_lr: false,
+            front_back: false,
+            fb_band: (0..nb).map(|k| frontback::band_of(k as f32 * bin_hz)).collect(),
+            fb_model: frontback::SHIPPED,
+            fb_votes: Vec::new(),
+            obs: Vec::with_capacity(MAX_PEAKS),
             band_w: vec![1.0; nb],
             sr: sample_rate,
             nch,
@@ -188,6 +203,7 @@ impl Analyzer {
         }
 
         self.votes.fill(0.0);
+        self.fb_votes.clear();
         let bin_hz = self.sr / FFT_N as f32;
         for k in self.k_min..=self.k_max {
             let (az, mag, total, gate) = match self.mode {
@@ -257,6 +273,9 @@ impl Analyzer {
             let w = (onset + STEADY_W * mag) * gate * (self.k_min as f32 / k as f32) * self.band_w[k];
             if w > 0.0 {
                 self.splat(az.to_degrees(), w);
+                if matches!(self.mode, Mode::Stereo { .. }) && self.fb_band[k].is_some() {
+                    self.fb_votes.push((k, az.to_degrees(), w));
+                }
             }
         }
 
@@ -315,7 +334,44 @@ impl Analyzer {
                 }
             }
         }
-        self.tracker.update(&self.peaks);
+        self.observe_peaks();
+        self.tracker.update(&self.obs, self.front_back.then_some(&self.fb_model));
+    }
+
+    /// Credit each voting bin's L/R power, per front/back band, to the peak it voted for, so
+    /// every tracked source gets its own interaural spectrum even with several sounds at once.
+    fn observe_peaks(&mut self) {
+        self.obs.clear();
+        self.obs.extend(self.peaks.iter().map(|&(az, strength)| tracker::Obs {
+            az,
+            strength,
+            pl: [0.0; frontback::FB_BANDS],
+            pr: [0.0; frontback::FB_BANDS],
+        }));
+        let Mode::Stereo { l, r } = self.mode else { return };
+        let (l, r) = if self.swap_lr { (r, l) } else { (l, r) };
+        for &(k, az, w) in &self.fb_votes {
+            let near = self
+                .obs
+                .iter_mut()
+                .map(|o| ((o.az - az).abs(), o))
+                .filter(|(d, _)| *d < FB_ASSIGN_DEG)
+                .min_by(|a, b| a.0.total_cmp(&b.0));
+            if let (Some((_, o)), Some(b)) = (near, self.fb_band[k]) {
+                o.pl[b] += w * self.spectra[l][k].norm_sqr();
+                o.pr[b] += w * self.spectra[r][k].norm_sqr();
+            }
+        }
+    }
+
+    /// Swap the front/back model (for held-out evaluation; the app uses [`frontback::SHIPPED`]).
+    pub fn set_front_back_model(&mut self, m: frontback::Model) {
+        self.fb_model = m;
+    }
+
+    /// Front/back features of the strongest tracked source (for training the model offline).
+    pub fn front_back_features(&self) -> Option<[f32; frontback::NF]> {
+        self.tracker.strongest_features()
     }
 
     /// v1's per-band sliders and game presets, as vote weights over the same six bands:

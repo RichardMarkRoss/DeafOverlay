@@ -1,106 +1,131 @@
-//! HUD drawing: dotted sphere, "Saturn" compass ring and arrowheads. A port of v1 `draw_sphere` /
-//! `draw_ring` / `draw_hint_box`. Platform-free: it writes premultiplied BGRA (`0xAARRGGBB`, the
-//! layout of a 32-bit top-down DIB) so it can be rendered to an image and checked offline.
-//! Text is drawn by the window layer (GDI); this module only reports where it goes.
+//! The in-game HUD in three user-selectable styles (from `design/HUD Concepts.html`):
+//!
+//! - **Orbit**: a faint wireframe orb over an F/R/B/L ring; arcs and chevrons on the ring.
+//! - **Radar**: a top-down disc of 16 sectors (or thin arcs around the crosshair).
+//! - **Compass tape**: a 360° bearing strip, front in the middle, behind at both ends.
+//!
+//! Shared encoding (accessibility guidance: never colour alone): loudness = size, thickness and
+//! opacity. Front = solid shape. Behind (5.1/7.1) = hollow or hatched + "BEHIND". Behind as guessed
+//! by the stereo front/back model = dashed + "BEHIND?". Every style draws a dark scrim so it
+//! survives bright scenes. Platform-free: draws into a [`Canvas`] and returns the text it wants
+//! (the window renders text with GDI).
 
+use crate::gfx::{Canvas, Paint, Rgb, BLACK, WHITE};
 use dsp::Source;
-use std::f32::consts::{FRAC_PI_2, PI};
-
-pub const HUD_W: usize = 380;
-pub const HUD_AREA_H: usize = 380;
+use std::f32::consts::PI;
 
 /// Loudness → 0..1 auto-gain (see [`Normalizer`]).
 const REF_MIN: f32 = 1.0; // ponytail: calibration knob. Tracker strengths below ~REF_MIN read as faint.
 const REF_HALF_LIFE_S: f32 = 3.0;
-const MIN_AMP: f32 = 0.02; // v1 dropped peaks below this
+const MIN_AMP: f32 = 0.02;
 
-pub struct Canvas<'a> {
-    pub w: usize,
-    pub h: usize,
-    pub px: &'a mut [u32],
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HudStyle {
+    #[default]
+    Orbit,
+    Radar,
+    Tape,
 }
 
-impl Canvas<'_> {
-    /// v1 `putpx_PM`: overwrite (no blend) with a premultiplied colour.
-    #[inline]
-    pub fn put(&mut self, x: i32, y: i32, a: u8, r: u8, g: u8, b: u8) {
-        if x < 0 || y < 0 || x as usize >= self.w || y as usize >= self.h {
-            return;
-        }
-        let pm = |c: u8| (c as u32 * a as u32 + 127) / 255;
-        self.px[y as usize * self.w + x as usize] = (a as u32) << 24 | pm(r) << 16 | pm(g) << 8 | pm(b);
-    }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PaletteKind {
+    #[default]
+    Brand,
+    ColorBlind,
+    HighContrast,
+}
 
-    pub fn fill(&mut self, a: u8, r: u8, g: u8, b: u8) {
-        for y in 0..self.h as i32 {
-            for x in 0..self.w as i32 {
-                self.put(x, y, a, r, g, b);
-            }
-        }
-    }
+/// HUD colours. `front`/`rear` only reinforce the shape encoding.
+#[derive(Clone, Copy, Debug)]
+pub struct Palette {
+    pub front: Rgb,
+    pub rear: Rgb,
+    pub line: Rgb,
+    pub muted: Rgb,
+    pub scrim: f32,
+}
 
-    #[allow(clippy::too_many_arguments)] // mirrors put(): position + ARGB
-    pub fn fill_rect(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, a: u8, r: u8, g: u8, b: u8) {
-        for y in y0..y1 {
-            for x in x0..x1 {
-                self.put(x, y, a, r, g, b);
-            }
+impl PaletteKind {
+    pub fn colors(self) -> Palette {
+        match self {
+            // Brand amber / cool blue (the demo's oklch values, in sRGB).
+            PaletteKind::Brand => Palette { front: Rgb(246, 178, 60), rear: Rgb(98, 190, 236), line: Rgb(246, 246, 246), muted: Rgb(170, 170, 170), scrim: 0.55 },
+            // Okabe-Ito orange / sky blue: distinct under the common colour-vision deficiencies.
+            PaletteKind::ColorBlind => Palette { front: Rgb(230, 159, 0), rear: Rgb(86, 180, 233), line: Rgb(246, 246, 246), muted: Rgb(170, 170, 170), scrim: 0.55 },
+            PaletteKind::HighContrast => Palette { front: Rgb(255, 230, 0), rear: WHITE, line: WHITE, muted: Rgb(215, 215, 215), scrim: 0.78 },
         }
     }
+}
 
-    /// GDI text leaves alpha at 0; v1 `force_alpha_rect` makes the glyph box opaque.
-    pub fn force_alpha(&mut self, x0: i32, y0: i32, x1: i32, y1: i32) {
-        let (x0, y0) = (x0.max(0) as usize, y0.max(0) as usize);
-        let (x1, y1) = ((x1.max(0) as usize).min(self.w), (y1.max(0) as usize).min(self.h));
-        for y in y0..y1 {
-            for p in &mut self.px[y * self.w + x0..y * self.w + x1.max(x0)] {
-                *p |= 0xFF00_0000;
-            }
-        }
+/// Everything about how the HUD looks (persisted with the settings).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HudParams {
+    pub style: HudStyle,
+    /// Radar only: thin arcs around the aim point instead of the disc.
+    pub crosshair: bool,
+    pub palette: PaletteKind,
+    pub scale: f32,   // 0.6 .. 1.6
+    pub opacity: f32, // 0.3 .. 1.0
+}
+
+impl Default for HudParams {
+    fn default() -> Self {
+        Self { style: HudStyle::Orbit, crosshair: false, palette: PaletteKind::Brand, scale: 1.0, opacity: 1.0 }
     }
+}
+
+/// Window size the style needs at 100% scale (the demo's dashed bounds).
+fn base_size(p: &HudParams) -> (f32, f32) {
+    match p.style {
+        HudStyle::Orbit => (240.0, 240.0),
+        HudStyle::Radar if p.crosshair => (180.0, 180.0),
+        HudStyle::Radar => (200.0, 200.0),
+        HudStyle::Tape => (520.0, 72.0),
+    }
+}
+
+/// Window size in pixels for these settings.
+pub fn size(p: &HudParams) -> (usize, usize) {
+    let (w, h) = base_size(p);
+    ((w * p.scale).round() as usize, (h * p.scale).round() as usize)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rear {
+    None,
+    /// Measured: 5.1/7.1 channels.
+    Real,
+    /// Stereo front/back model's guess.
+    Guess,
 }
 
 /// One direction to show. `ang`: radians, 0 = front, + = right. `amp`: 0..1 loudness.
-/// `rear_gain`: accent strength when the sound is behind (360° layouts only).
 #[derive(Clone, Copy, Debug)]
 pub struct Peak {
     pub ang: f32,
     pub amp: f32,
-    pub rear_gain: f32,
+    pub rear: Rear,
 }
 
-/// User-adjustable placement, same defaults and meaning as v1's sliders.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Layout {
-    pub sphere_scale: f32,  // 0.6 .. 1.6
-    pub ring_offset_y: f32, // 0.40 .. 0.90 of the HUD height
-    pub sphere_x: f32,      // 0..1 of the HUD width
-    pub sphere_y: f32,      // 0..1 of the HUD height
+/// What the audio can and can't tell, for the "rear needs 7.1" notes.
+#[derive(Clone, Copy, Debug)]
+pub struct Scene {
+    pub full_360: bool,
+    pub front_back: bool,
 }
 
-impl Default for Layout {
-    fn default() -> Self {
-        Self { sphere_scale: 1.0, ring_offset_y: 0.66, sphere_x: 0.5, sphere_y: 0.47 }
-    }
+/// Text for the window layer to draw, centred on (x, y) in canvas pixels, with a dark outline.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Label {
+    pub x: f32,
+    pub y: f32,
+    pub text: &'static str,
+    pub rgb: Rgb,
+    pub px: i32,
+    pub mono: bool,
 }
 
-const BASE_SCALE: f32 = 0.13;
-
-impl Layout {
-    /// (cx, cy, radius)
-    pub fn sphere(&self) -> (f32, f32, f32) {
-        let r = HUD_W.min(HUD_AREA_H) as f32 * BASE_SCALE * self.sphere_scale;
-        (self.sphere_x * HUD_W as f32, self.sphere_y * HUD_AREA_H as f32, r)
-    }
-
-    /// (cx, cy, semi-axis x, semi-axis y)
-    pub fn ring(&self) -> (f32, f32, f32, f32) {
-        let a = HUD_W.min(HUD_AREA_H) as f32 * BASE_SCALE * 1.1 * self.sphere_scale;
-        (self.sphere_x * HUD_W as f32, self.ring_offset_y * HUD_AREA_H as f32, a, a * 0.45)
-    }
-}
-
-/// Tracker strengths are level-dependent and unbounded; v1's HUD wants 0..1. A slow auto-gain
+/// Tracker strengths are level-dependent and unbounded; the HUD wants 0..1. A slow auto-gain
 /// (peak reference that halves every few seconds, floored so silence stays dim) plays the role of
 /// v1's auto gain. sqrt compresses the range so quieter sounds stay visible next to loud ones.
 pub struct Normalizer {
@@ -114,223 +139,307 @@ impl Default for Normalizer {
 }
 
 impl Normalizer {
+    /// Quietest first, so the loudest draws on top. Anything past ±90° is behind: measured on
+    /// 5.1/7.1, otherwise it can only have come from the stereo front/back guess.
     pub fn peaks(&mut self, sources: &[Source], full_360: bool, sensitivity: f32, dt: f32) -> Vec<Peak> {
         let loudest = sources.iter().map(|s| s.strength).fold(0.0, f32::max);
         self.reference = (self.reference * 0.5f32.powf(dt / REF_HALF_LIFE_S)).max(loudest).max(REF_MIN);
-        sources
+        let mut out: Vec<Peak> = sources
             .iter()
             .map(|s| {
                 let amp = ((s.strength / self.reference).sqrt() * s.confidence * sensitivity).clamp(0.0, 1.0);
-                let ang = s.azimuth.to_radians();
-                // Stereo can't place anything behind, so no rear accent (v1 did the same).
-                let rear = if full_360 { ((ang.abs() - FRAC_PI_2) / FRAC_PI_2).clamp(0.0, 1.0) * amp } else { 0.0 };
-                Peak { ang, amp, rear_gain: rear }
+                let rear = match (s.azimuth.abs() > 90.0, full_360) {
+                    (false, _) => Rear::None,
+                    (true, true) => Rear::Real,
+                    (true, false) => Rear::Guess,
+                };
+                Peak { ang: s.azimuth.to_radians(), amp, rear }
             })
             .filter(|p| p.amp >= MIN_AMP)
-            .collect()
+            .collect();
+        out.sort_by(|a, b| a.amp.total_cmp(&b.amp));
+        out
     }
 }
 
-/// v1 `dir_color`: front is warm (white → amber → red), behind is cool blue; `s` deepens it.
-fn dir_color(s: f32, ang: f32) -> (u8, u8, u8) {
-    let s = s.clamp(0.0, 1.0);
-    let c = |v: f32| v.clamp(0.0, 255.0) as u8;
-    if ang.abs() <= FRAC_PI_2 {
-        (255, c(255.0 - s * 215.0), c(245.0 - s * 245.0))
-    } else {
-        (c(150.0 - s * 130.0), c(205.0 - s * 95.0), 255)
+/// Draw the HUD with its top-left at `origin` in the canvas. Returns the labels to draw on top.
+pub fn draw(c: &mut Canvas, origin: (f32, f32), p: &HudParams, peaks: &[Peak], scene: Scene) -> Vec<Label> {
+    let mut out = Hud { labels: Vec::new(), pal: p.palette.colors(), k: p.scale, scene };
+    let before = c.alpha;
+    c.alpha = p.opacity;
+    match p.style {
+        HudStyle::Orbit => out.orbit(c, origin, peaks),
+        HudStyle::Radar if p.crosshair => out.crosshair(c, origin, peaks),
+        HudStyle::Radar => out.radar(c, origin, peaks),
+        HudStyle::Tape => out.tape(c, origin, peaks),
     }
+    c.alpha = before;
+    out.labels
 }
 
-fn wrap_pi(x: f32) -> f32 {
-    x - (x / (2.0 * PI)).round() * 2.0 * PI
+struct Hud {
+    labels: Vec<Label>,
+    pal: Palette,
+    k: f32,
+    scene: Scene,
 }
 
-/// Clear, then sphere and ring, like v1 `render_frame`. `dim` = settings/move mode: a light
-/// full-window dim so every pixel is opaque enough to take clicks.
-pub fn draw(c: &mut Canvas, lay: &Layout, peaks: &[Peak], dim: bool) {
-    if dim {
-        c.fill(150, 0, 0, 0);
-    } else {
-        c.px.fill(0);
+impl Hud {
+    fn label(&mut self, x: f32, y: f32, text: &'static str, rgb: Rgb, px: f32, mono: bool) {
+        let px = (px * self.k.max(1.0)).round().max(10.0) as i32; // below 10 px, outlined text smears
+        self.labels.push(Label { x, y, text, rgb, px, mono });
     }
-    let (cx, cy, r) = lay.sphere();
-    draw_sphere(c, cx, cy, r, 22.0, peaks);
-    let (rx, ry, a, b) = lay.ring();
-    draw_ring(c, rx, ry, a, b, peaks);
-}
 
-fn draw_sphere(c: &mut Canvas, cx: f32, cy: f32, radius: f32, tilt_deg: f32, peaks: &[Peak]) {
-    let (st, ct) = tilt_deg.to_radians().sin_cos();
-    const LAT: usize = 16;
-    const LON: usize = 36;
-    for i in 1..LAT {
-        let phi = i as f32 / LAT as f32 * PI - FRAC_PI_2;
-        let (sy, cr) = phi.sin_cos();
-        for j in 0..LON {
-            let th = j as f32 / LON as f32 * 2.0 * PI;
-            let (x, y, z) = (cr * th.cos(), sy, cr * th.sin());
-            let y2 = ct * y - st * z;
-            let z2 = st * y + ct * z;
-            let denom = 1.0 + 0.55 * z2;
-            let xp = x / denom * radius + cx;
-            let yp = y2 / denom * radius + cy;
-            let (vx, vy) = (xp - cx, yp - cy);
-            let vlen = vx.hypot(vy).max(1.0);
+    fn color(&self, p: &Peak) -> Rgb {
+        if p.rear == Rear::None { self.pal.front } else { self.pal.rear }
+    }
 
-            // Light the side of the sphere that faces each sound; the loudest facing one wins.
-            let (mut dir_int, mut dom_ang) = (0.0f32, 0.0f32);
-            for p in peaks {
-                let align = (vx * p.ang.sin() - vy * p.ang.cos()) / vlen;
-                let contrib = align.max(0.0) * p.amp;
-                if contrib > dir_int {
-                    dir_int = contrib;
-                    dom_ang = p.ang;
-                }
-            }
-
-            let grow = 1.0 + 0.7 * dir_int;
-            let dot_r = ((radius * 0.012 * grow) as i32).max(2);
-            let depth = z2 * 0.5 + 0.5;
-            let bright = (0.26 + 0.28 * depth + 1.2 * dir_int).min(1.0);
-            let (rr, gg, bb) = dir_color(dir_int, dom_ang);
-            let a = (20.0 + 215.0 * bright).clamp(0.0, 238.0) as u8;
-            let (xi, yi) = (xp.round() as i32, yp.round() as i32);
-            for dy in -dot_r..=dot_r {
-                for dx in -dot_r..=dot_r {
-                    if dx * dx + dy * dy <= dot_r * dot_r {
-                        c.put(xi + dx, yi + dy, a, rr, gg, bb);
-                    }
-                }
-            }
+    fn rear_tag(&mut self, p: &Peak, x: f32, y: f32) {
+        match p.rear {
+            Rear::Real => self.label(x, y, "BEHIND", self.pal.rear, 10.0, true),
+            Rear::Guess => self.label(x, y, "BEHIND?", self.pal.rear, 10.0, true),
+            Rear::None => {}
         }
     }
 
-    // Rays toward each sound, plus a pale rear accent when it's behind.
-    for p in peaks {
-        let (rr, gg, bb) = dir_color(p.amp, p.ang);
-        let (fx, fy) = (p.ang.sin(), -p.ang.cos());
-        let a = (40.0 + 150.0 * p.amp) as u8;
-        for i in 0..(radius * 0.9) as i32 {
-            c.put((cx + fx * i as f32) as i32, (cy + fy * i as f32) as i32, a, rr, gg, bb);
-        }
-        if p.rear_gain > 0.0 {
-            let (rx, ry) = ((p.ang + PI).sin(), -(p.ang + PI).cos());
-            let a = (20.0 + 160.0 * p.rear_gain).clamp(0.0, 255.0) as u8;
-            for i in 0..(radius * 0.55) as i32 {
-                c.put((cx + rx * i as f32) as i32, (cy + ry * i as f32) as i32, a, 200, 220, 255);
-            }
+    /// Stereo can't see behind (only the front/back guess can): say so instead of hiding it.
+    fn rear_unknown(&self) -> bool {
+        !self.scene.full_360
+    }
+
+    fn rear_note(&self) -> &'static str {
+        if self.scene.front_back { "rear: guess only" } else { "rear needs 7.1" }
+    }
+
+    /// Chevron pointing along `dir` (canvas radians). Shape carries front / behind / guessed.
+    #[allow(clippy::too_many_arguments)]
+    fn chevron(&self, c: &mut Canvas, x: f32, y: f32, dir: f32, size: f32, p: &Peak, alpha: f32) {
+        let (s, co) = dir.sin_cos();
+        let pts: Vec<(f32, f32)> = [(1.0f32, 0.0f32), (-0.7, 0.8), (-0.25, 0.0), (-0.7, -0.8)]
+            .iter()
+            .map(|(u, v)| (x + (u * co - v * s) * size, y + (u * s + v * co) * size))
+            .collect();
+        c.polygon(&pts, BLACK, 0.75 * alpha, Paint::Stroke { width: 3.5, dash: None });
+        match p.rear {
+            Rear::None => c.polygon(&pts, self.pal.front, alpha, Paint::Fill),
+            Rear::Real => c.polygon(&pts, self.pal.rear, alpha, Paint::Stroke { width: 2.0, dash: None }),
+            Rear::Guess => c.polygon(&pts, self.pal.rear, alpha, Paint::Stroke { width: 2.0, dash: Some(5.0) }),
         }
     }
-}
 
-fn draw_ring(c: &mut Canvas, cx: f32, cy: f32, a: f32, b: f32, peaks: &[Peak]) {
-    let th_px = (a * 0.06).max(1.0);
-    // v1 scanned the whole window; only the ellipse's bounding box can light up.
-    let pad = th_px + 2.0;
-    let (x0, x1) = ((cx - a - pad).floor() as i32, (cx + a + pad).ceil() as i32);
-    let (y0, y1) = ((cy - b - pad).floor() as i32, (cy + b + pad).ceil() as i32);
-    for y in y0..=y1 {
-        for x in x0..=x1 {
-            let (dx, dy) = (x as f32 - cx, y as f32 - cy);
-            let r = ((dx * dx) / (a * a) + (dy * dy) / (b * b)).sqrt();
-            let t = 1.0 - ((r - 1.0).abs() / (th_px / a)).min(1.0);
-            if t <= 0.0 {
+    fn orbit(&mut self, c: &mut Canvas, (ox, oy): (f32, f32), peaks: &[Peak]) {
+        let k = self.k;
+        let (cx, cy) = (ox + 120.0 * k, oy + 120.0 * k);
+        let (orb_y, r) = (cy - 42.0 * k, 44.0 * k);
+        let (ring_y, rx, ry) = (cy + 44.0 * k, 100.0 * k, 36.0 * k);
+        c.soft_ellipse(cx, cy + 8.0 * k, 118.0 * k, 114.0 * k, 0.3, BLACK, self.pal.scrim);
+
+        // wireframe orb: faint, so it doesn't compete with the game's own white HUD
+        let line = self.pal.line;
+        c.ellipse_stroke(cx, orb_y, r, r, 1.0, line, 0.3, None, None);
+        for f in [-0.55f32, 0.0, 0.55] {
+            let w = (1.0 - f * f).sqrt();
+            c.ellipse_stroke(cx, orb_y + f * r, r * w, r * 0.28 * w, 1.0, line, 0.25, None, None);
+        }
+        for f in [0.35, 0.75] {
+            c.ellipse_stroke(cx, orb_y, r * f, r, 1.0, line, 0.25, None, None);
+        }
+        // the orb glows toward the loudest sound (bright in front, dim behind)
+        if let Some(top) = peaks.last() {
+            let (gx, gy) = (cx + top.ang.sin() * r * 0.62, orb_y - top.ang.cos() * r * 0.28);
+            let a = if top.rear == Rear::None { 0.55 } else { 0.3 } * top.amp;
+            c.soft_ellipse(gx, gy, r * 0.62, r * 0.62, 1.0, self.color(top), a);
+        }
+
+        c.ellipse_stroke(cx, ring_y, rx, ry, 1.5, line, 0.7, None, None);
+        let pt = |deg: f32, grow: f32| {
+            let a = deg.to_radians();
+            (cx + (rx + grow) * a.sin(), ring_y - (ry + grow * 0.36) * a.cos())
+        };
+        for (deg, t) in [(0.0, "F"), (90.0, "R"), (180.0, "B"), (-90.0, "L")] {
+            // A chevron sitting on this letter already says the direction; don't stack them.
+            if peaks.iter().any(|p| crate::gfx::angle_diff(p.ang.to_degrees(), deg).abs() < 12.0) {
                 continue;
             }
-            c.put(x, y, (t * 150.0) as u8, 255, 255, 255);
+            let (x, y) = pt(deg, 14.0 * k);
+            let dim = deg == 180.0 && self.rear_unknown() && !self.scene.front_back;
+            self.label(x, y, t, if dim { self.pal.muted } else { line }, 11.0, false);
+        }
+        for p in peaks {
+            let deg = p.ang.to_degrees();
+            let dash = if p.rear == Rear::Guess { Some(8.0) } else { None };
+            let (w, a) = ((2.0 + 6.0 * p.amp) * k, 0.35 + 0.65 * p.amp);
+            c.ellipse_stroke(cx, ring_y, rx, ry, w, self.color(p), a, Some((deg, 14.0 + 36.0 * p.amp)), dash);
+            let (x, y) = pt(deg, (10.0 + 6.0 * p.amp) * k);
+            let dir = (-p.ang.cos() / ry).atan2(p.ang.sin() / rx); // ellipse outward normal
+            self.chevron(c, x, y, dir, (6.0 + 7.0 * p.amp) * k, p, 0.5 + 0.5 * p.amp);
+            self.rear_tag(p, x, y + 16.0 * k);
+        }
+    }
 
-            let ang = (dx / a).atan2(-dy / b); // 0 at top = front
-            let (mut best, mut best_amp, mut best_ang) = (0.0f32, 0.0f32, 0.0f32);
-            for p in peaks {
-                let dist = wrap_pi(ang - p.ang).abs();
-                let spread = 0.30 + 0.55 * p.amp; // louder = wider arc
-                let hot = (1.0 - dist / spread).max(0.0);
-                let win = (1.0 - (hot * PI).cos()) * 0.5;
-                let g = win * (0.30 + 0.70 * p.amp); // louder = brighter
-                if g > best {
-                    best = g;
-                    best_amp = p.amp;
-                    best_ang = p.ang;
+    fn radar(&mut self, c: &mut Canvas, (ox, oy): (f32, f32), peaks: &[Peak]) {
+        let k = self.k;
+        let (cx, cy) = (ox + 100.0 * k, oy + 100.0 * k);
+        let (r0, r) = (11.0 * k, 76.0 * k);
+        c.circle(cx, cy, r + 8.0 * k, BLACK, self.pal.scrim, Paint::Fill);
+        if self.rear_unknown() {
+            c.wedge(cx, cy, 0.0, r, 180.0, 90.0, WHITE, 0.07, Paint::Hatch);
+            self.label(cx, cy + r + 2.0 * k, self.rear_note(), self.pal.muted, 9.0, true);
+        }
+        let line = self.pal.line;
+        for (f, a) in [(0.33, 0.18), (0.66, 0.18), (1.0, 0.55)] {
+            c.circle(cx, cy, r0 + (r - r0) * f, line, a, Paint::Stroke { width: 1.0, dash: None });
+        }
+        for i in 0..16 {
+            let (s, co) = (i as f32 * 22.5).to_radians().sin_cos();
+            c.line(cx + s * r0, cy - co * r0, cx + s * r, cy - co * r, 1.0, line, 0.12);
+        }
+        for (deg, t) in [(0.0f32, "000"), (90.0, "090"), (180.0, "180"), (270.0, "270")] {
+            let (s, co) = deg.to_radians().sin_cos();
+            self.label(cx + s * (r + 14.0 * k), cy - co * (r + 14.0 * k), t, self.pal.muted, 9.0, true);
+        }
+        // loudest sound per sector
+        let mut sectors: [Option<Peak>; 16] = [None; 16];
+        for p in peaks {
+            let i = ((p.ang.to_degrees() / 22.5).round() as i32).rem_euclid(16) as usize;
+            if sectors[i].is_none_or(|q| q.amp < p.amp) {
+                sectors[i] = Some(*p);
+            }
+        }
+        for (i, p) in sectors.iter().enumerate() {
+            let Some(p) = p else { continue };
+            let centre = i as f32 * 22.5;
+            let rr = r0 + (r - r0) * (0.25 + 0.75 * p.amp);
+            let a = 0.45 + 0.55 * p.amp;
+            match p.rear {
+                Rear::None => c.wedge(cx, cy, r0, rr, centre, 10.0, self.pal.front, a, Paint::Fill),
+                Rear::Real => {
+                    c.wedge(cx, cy, r0, rr, centre, 10.0, self.pal.rear, a, Paint::Hatch);
+                    c.wedge(cx, cy, r0, rr, centre, 10.0, self.pal.rear, a, Paint::Stroke { width: 1.5, dash: None });
                 }
+                Rear::Guess => c.wedge(cx, cy, r0, rr, centre, 10.0, self.pal.rear, a, Paint::Stroke { width: 1.5, dash: Some(6.0) }),
             }
-            if best > 0.0 {
-                let (rr, gg, bb) = dir_color(best_amp, best_ang);
-                c.put(x, y, (best * 235.0).clamp(0.0, 235.0) as u8, rr, gg, bb);
-            }
+            let (s, co) = centre.to_radians().sin_cos();
+            self.rear_tag(p, cx + s * (rr + 12.0 * k), cy - co * (rr + 12.0 * k));
+        }
+        let you = [(cx, cy - 7.0 * k), (cx + 5.0 * k, cy + 5.0 * k), (cx - 5.0 * k, cy + 5.0 * k)];
+        c.polygon(&you, line, 1.0, Paint::Fill);
+    }
+
+    /// Radar's crosshair mode: thin arcs around the aim point, nothing else.
+    fn crosshair(&mut self, c: &mut Canvas, (ox, oy): (f32, f32), peaks: &[Peak]) {
+        let k = self.k;
+        let (cx, cy, r) = (ox + 90.0 * k, oy + 90.0 * k, 62.0 * k);
+        for p in peaks {
+            let deg = p.ang.to_degrees();
+            let span = 2.0 * (10.0 + 22.0 * p.amp);
+            let w = (3.0 + 5.0 * p.amp) * k;
+            c.ellipse_stroke(cx, cy, r, r, w + 3.0, BLACK, 0.7, Some((deg, span)), None);
+            let dash = match p.rear {
+                Rear::None => None,
+                Rear::Real => Some(12.0),
+                Rear::Guess => Some(6.0),
+            };
+            c.ellipse_stroke(cx, cy, r, r, w, self.color(p), 0.5 + 0.5 * p.amp, Some((deg, span)), dash);
+            self.rear_tag(p, cx + p.ang.sin() * (r + 18.0 * k), cy - p.ang.cos() * (r + 18.0 * k));
         }
     }
 
-    // Arrowheads on the ring: size and brightness scale with loudness, hue with front/back.
-    for p in peaks {
-        let (rr, gg, bb) = dir_color(p.amp, p.ang);
-        let th = p.ang;
-        let (ex, ey) = (cx + a * th.sin(), cy - b * th.cos());
-        let (mut nx, mut ny) = (-b * th.cos(), -a * th.sin());
-        let nlen = nx.hypot(ny).max(1.0);
-        nx /= nlen;
-        ny /= nlen;
-        let (tx, ty) = (th.cos(), th.sin());
-        let half = (3.0 + 5.0 * p.amp) as i32;
-        let reach = (4.0 + 7.0 * p.amp) as i32;
-        let al = (110.0 + 130.0 * p.amp).clamp(0.0, 240.0) as u8;
-        for i in -half..=half {
-            for j in 0..reach {
-                let xi = ex + nx * i as f32 + a * 0.035 * tx * j as f32;
-                let yi = ey + ny * i as f32 + b * 0.035 * ty * j as f32;
-                c.put(xi as i32, yi as i32, al, rr, gg, bb);
+    fn tape(&mut self, c: &mut Canvas, (ox, oy): (f32, f32), peaks: &[Peak]) {
+        let k = self.k;
+        let (cx, cy) = (ox + 260.0 * k, oy + 36.0 * k);
+        let (w, h) = (480.0 * k, 44.0 * k);
+        let (x0, top) = (cx - w / 2.0, cy - h / 2.0);
+        let xat = |deg: f32| cx + deg / 180.0 * (w / 2.0);
+        c.rect(x0 - 16.0 * k, top - 8.0 * k, x0 + w + 16.0 * k, top + h + 14.0 * k, 10.0 * k, BLACK, self.pal.scrim, Paint::Fill);
+        if self.rear_unknown() {
+            c.rect(x0, top, xat(-90.0), top + h, 0.0, WHITE, 0.08, Paint::Hatch);
+            c.rect(xat(90.0), top, x0 + w, top + h, 0.0, WHITE, 0.08, Paint::Hatch);
+            let note = self.rear_note();
+            self.label((x0 + xat(-90.0)) / 2.0, top + h * 0.72, note, self.pal.muted, 9.0, true);
+            self.label((xat(90.0) + x0 + w) / 2.0, top + h * 0.72, note, self.pal.muted, 9.0, true);
+        }
+        let line = self.pal.line;
+        for i in 0..=24 {
+            let deg = -180.0 + 15.0 * i as f32;
+            let major = i % 3 == 0;
+            let len = if major { 8.0 } else { 4.0 } * k;
+            c.line(xat(deg), top, xat(deg), top + len, 1.0, line, if major { 0.6 } else { 0.25 });
+        }
+        for (d, t) in [(-180.0, "B"), (-90.0, "L"), (0.0, "F"), (90.0, "R"), (180.0, "B")] {
+            self.label(xat(d), top + 16.0 * k, t, if d == 0.0 { line } else { self.pal.muted }, 11.0, false);
+        }
+        let notch = [(cx, top + h + 2.0 * k), (cx - 5.0 * k, top + h + 9.0 * k), (cx + 5.0 * k, top + h + 9.0 * k)];
+        c.polygon(&notch, line, 1.0, Paint::Fill);
+        for p in peaks {
+            let x = xat(p.ang.to_degrees());
+            let (bh, bw, yb) = ((8.0 + 24.0 * p.amp) * k, (3.0 + 4.0 * p.amp) * k, top + h);
+            let a = 0.45 + 0.55 * p.amp;
+            c.rect(x - bw / 2.0 - 1.5, yb - bh - 1.5, x + bw / 2.0 + 1.5, yb + 1.5, 0.0, BLACK, 0.7 * a, Paint::Fill);
+            let paint = match p.rear {
+                Rear::None => Paint::Fill,
+                Rear::Real => Paint::Stroke { width: 1.5, dash: None },
+                Rear::Guess => Paint::Stroke { width: 1.5, dash: Some(5.0) },
+            };
+            c.rect(x - bw / 2.0, yb - bh, x + bw / 2.0, yb, 0.0, self.color(p), a, paint);
+            self.chevron(c, x, yb - bh - 7.0 * k, PI / 2.0, (4.0 + 3.0 * p.amp) * k, p, a);
+            if p.rear == Rear::Guess {
+                self.label(x + 9.0 * k, yb - bh - 7.0 * k, "?", self.pal.rear, 10.0, true);
             }
         }
     }
-}
-
-/// v1 `draw_hint_box` background. Returns the text origin for the three lines.
-pub fn draw_hint_box(c: &mut Canvas) -> (i32, i32) {
-    let (x0, y0) = (14, 14);
-    let x1 = (c.w as i32 - 14).min(x0 + 310);
-    let y1 = (c.h as i32 - 14).min(y0 + 62);
-    c.fill_rect(x0, y0, x1, y1, 170, 12, 12, 14);
-    c.fill_rect(x0, y0, x1, y1.min(y0 + 18), 200, 28, 28, 34);
-    (x0 + 10, y0 + 2)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn lit(px: &[u32], x0: usize, x1: usize) -> u32 {
-        // Summed red-channel energy of warm (front) ring pixels in a column band.
-        (0..HUD_AREA_H)
-            .flat_map(|y| (x0..x1).map(move |x| px[y * HUD_W + x]))
-            .map(|p| (p >> 16) & 0xFF)
-            .sum()
+    fn render(style: HudStyle, crosshair: bool, peaks: &[Peak]) -> (Vec<u32>, usize, usize) {
+        let p = HudParams { style, crosshair, ..Default::default() };
+        let (w, h) = size(&p);
+        let mut px = vec![0u32; w * h];
+        draw(&mut Canvas::new(w, h, &mut px), (0.0, 0.0), &p, peaks, Scene { full_360: true, front_back: false });
+        (px, w, h)
+    }
+
+    /// Summed alpha in the left and right halves.
+    fn halves(px: &[u32], w: usize, h: usize) -> (i64, i64) {
+        let side = |r: std::ops::Range<usize>| (0..h).flat_map(|y| r.clone().map(move |x| (px[y * w + x] >> 24) as i64)).sum();
+        (side(0..w / 2), side(w / 2..w))
     }
 
     #[test]
-    fn a_sound_on_the_right_lights_the_right() {
-        let mut px = vec![0u32; HUD_W * HUD_AREA_H];
-        let quiet = {
-            let mut c = Canvas { w: HUD_W, h: HUD_AREA_H, px: &mut px };
-            draw(&mut c, &Layout::default(), &[], false);
-            (lit(&px, 0, HUD_W / 2), lit(&px, HUD_W / 2, HUD_W))
-        };
-        let mut c = Canvas { w: HUD_W, h: HUD_AREA_H, px: &mut px };
-        draw(&mut c, &Layout::default(), &[Peak { ang: FRAC_PI_2, amp: 1.0, rear_gain: 0.0 }], false);
-        let (l, r) = (lit(&px, 0, HUD_W / 2), lit(&px, HUD_W / 2, HUD_W));
-        // The idle sphere is already white (red channel full), so look for a clear rise on the
-        // right and no change at all on the left.
-        assert!(r > quiet.1 * 3 / 2 && l == quiet.0, "left {l} right {r} (idle {quiet:?})");
+    fn every_style_lights_the_side_the_sound_is_on() {
+        let right = [Peak { ang: PI / 2.0, amp: 1.0, rear: Rear::None }];
+        for (style, crosshair) in [(HudStyle::Orbit, false), (HudStyle::Radar, false), (HudStyle::Radar, true), (HudStyle::Tape, false)] {
+            let (idle, w, h) = render(style, crosshair, &[]);
+            let (lit, ..) = render(style, crosshair, &right);
+            let ((il, ir), (l, r)) = (halves(&idle, w, h), halves(&lit, w, h));
+            let (gain_l, gain_r) = (l - il, r - ir);
+            assert!(gain_r > 2000 && gain_r > 3 * gain_l.max(0), "{style:?}/crosshair {crosshair}: left +{gain_l}, right +{gain_r}");
+        }
     }
 
     #[test]
-    fn normalizer_maps_loudest_to_one_and_drops_silence() {
+    fn behind_is_labelled_and_a_guess_says_so() {
+        let behind = |rear| [Peak { ang: 150f32.to_radians(), amp: 0.8, rear }];
+        let p = HudParams::default();
+        let scene = Scene { full_360: false, front_back: true };
+        let mut px = vec![0u32; 240 * 240];
+        let labels = draw(&mut Canvas::new(240, 240, &mut px), (0.0, 0.0), &p, &behind(Rear::Real), scene);
+        assert!(labels.iter().any(|l| l.text == "BEHIND"));
+        let labels = draw(&mut Canvas::new(240, 240, &mut px), (0.0, 0.0), &p, &behind(Rear::Guess), scene);
+        assert!(labels.iter().any(|l| l.text == "BEHIND?"));
+    }
+
+    #[test]
+    fn normalizer_scales_to_the_loudest_and_marks_behind_by_layout() {
         let mut n = Normalizer::default();
         let s = |az, strength| Source { azimuth: az, strength, confidence: 1.0 };
         let p = n.peaks(&[s(30.0, 8.0), s(-60.0, 2.0)], false, 1.0, 0.016);
-        assert!((p[0].amp - 1.0).abs() < 1e-6 && p[1].amp > 0.4 && p[1].amp < 0.6);
-        assert!(p.iter().all(|p| p.rear_gain == 0.0));
-        let p = n.peaks(&[s(150.0, 8.0)], true, 1.0, 0.016);
-        assert!(p[0].rear_gain > 0.5, "behind in 360 mode gets the rear accent");
+        assert!((p[1].amp - 1.0).abs() < 1e-6 && p[0].amp > 0.4 && p[0].amp < 0.6, "quietest first");
+        assert_eq!(n.peaks(&[s(150.0, 8.0)], true, 1.0, 0.016)[0].rear, Rear::Real);
+        assert_eq!(n.peaks(&[s(150.0, 8.0)], false, 1.0, 0.016)[0].rear, Rear::Guess);
         assert!(n.peaks(&[s(0.0, 1e-4)], false, 1.0, 0.016).is_empty());
     }
 }

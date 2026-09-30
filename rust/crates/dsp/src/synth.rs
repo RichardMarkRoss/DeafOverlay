@@ -123,3 +123,61 @@ pub fn binaural(mono: &[f32], az: f32, sr: f32) -> Vec<f32> {
 pub fn mix(a: &[f32], b: &[f32]) -> Vec<f32> {
     a.iter().zip(b).map(|(x, y)| x + y).collect()
 }
+
+/// Bursts like [`bursts`] but with a random spectral colour (tilt + ripple), so a front/back
+/// classifier can't lean on one source spectrum.
+pub fn colored_bursts(len: usize, sr: f32, seed: u64) -> Vec<f32> {
+    use realfft::RealFftPlanner;
+    let mut rng = Rng(seed | 1);
+    let mut uni = |lo: f32, hi: f32| lo + (hi - lo) * (rng.next() + 1.0) * 0.5;
+    let n = len + (len & 1);
+    let mut planner = RealFftPlanner::<f32>::new();
+    let (fwd, inv) = (planner.plan_fft_forward(n), planner.plan_fft_inverse(n));
+    let mut x: Vec<f32> = (0..n).map(|_| uni(-1.0, 1.0)).collect();
+    let mut spec = fwd.make_output_vec();
+    let _ = fwd.process(&mut x, &mut spec);
+    let tilt = uni(-6.0, 3.0); // dB per octave around 1 kHz
+    let knots: Vec<f32> = (0..12).map(|_| uni(-6.0, 6.0)).collect(); // ripple over log2(f) 5..14.5
+    for (k, c) in spec.iter_mut().enumerate() {
+        let f = k as f32 * sr / n as f32 + 1.0;
+        let p = ((f.log2() - 5.0) / 9.5 * 11.0).clamp(0.0, 11.0);
+        let (i, t) = (p.floor() as usize, p.fract());
+        let ripple = knots[i] * (1.0 - t) + knots[(i + 1).min(11)] * t;
+        *c *= 10f32.powf((tilt * (f / 1000.0).log2() + ripple) / 20.0);
+    }
+    let _ = inv.process(&mut spec, &mut x);
+    let rms = (x.iter().map(|v| v * v).sum::<f32>() / n as f32).sqrt().max(1e-12);
+    let (period, tau) = ((0.25 * sr) as usize, 0.03 * sr);
+    x.truncate(len);
+    x.iter().enumerate().map(|(i, v)| 0.17 * v / rms * (-((i % period) as f32) / tau).exp()).collect()
+}
+
+/// One measured head-related impulse response pair (see `rust/tools/sofa_to_hrir.py`).
+pub struct Hrir {
+    pub azimuth: f32,
+    pub left: Vec<f32>,
+    pub right: Vec<f32>,
+}
+
+/// Read a `.hrir` file: u32 count, u32 taps, then per direction f32 azimuth + taps left + taps right.
+pub fn load_hrir(path: &std::path::Path) -> std::io::Result<Vec<Hrir>> {
+    let bytes = std::fs::read(path)?;
+    let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "truncated .hrir");
+    let word = |i: usize| bytes.get(i * 4..i * 4 + 4).map(|b| [b[0], b[1], b[2], b[3]]).ok_or_else(bad);
+    let (count, taps) = (u32::from_le_bytes(word(0)?) as usize, u32::from_le_bytes(word(1)?) as usize);
+    let mut at = 2;
+    let mut read = |n: usize| -> std::io::Result<Vec<f32>> {
+        let v = (at..at + n).map(|i| word(i).map(f32::from_le_bytes)).collect();
+        at += n;
+        v
+    };
+    (0..count)
+        .map(|_| Ok(Hrir { azimuth: read(1)?[0], left: read(taps)?, right: read(taps)? }))
+        .collect()
+}
+
+/// Render `mono` through an HRIR pair: what a game's HRTF spatializer outputs for headphones.
+pub fn render_hrir(mono: &[f32], h: &Hrir) -> Vec<f32> {
+    let conv = |ir: &[f32], i: usize| -> f32 { ir.iter().take(i + 1).enumerate().map(|(j, c)| c * mono[i - j]).sum() };
+    (0..mono.len()).flat_map(|i| [conv(&h.left, i), conv(&h.right, i)]).collect()
+}

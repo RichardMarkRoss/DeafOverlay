@@ -1,0 +1,779 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HUD Concepts</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<!--
+  DESIGN SYSTEM (shared by all three concepts)
+  Brand      Heroes Without Sound: "See Sound. Play Equal." Black canvas, soft grey glow, glassy white UI.
+  Type       Geist 12 / 13 / 15 / 20 / 28 (UI), Geist Mono 11 / 12 (numbers, bearings, readouts).
+             The app renders text with GDI, so Geist gets embedded (AddFontMemResourceEx).
+  Space      4px grid: 4 8 12 16 24 32.
+  Encoding   Loudness = size + thickness + opacity (never hue alone).
+             Front = solid chevron. Behind (5.1/7.1) = hollow chevron + "BEHIND".
+             Behind, guessed (stereo front/back model) = dashed chevron + "?".
+             Hue only reinforces front/behind. Palettes: Brand, Colour-blind safe, High contrast.
+  Legibility Every HUD draws a dark scrim under its marks so it survives bright scenes.
+  Honesty    Only what the DSP outputs today: azimuth, loudness, front/behind (real or guessed).
+             No sound-type icons: the DSP doesn't classify sounds.
+  Buildable  Compact windows only (no fullscreen layer: anti-cheat ESP heuristic); CPU-drawable
+             shapes (lines, arcs, fills, soft glows), no blur.
+-->
+<style>
+:root {
+  --bg: oklch(0.13 0 0);
+  --bg-glow: oklch(0.27 0 0);
+  --ink: oklch(0.96 0 0);
+  --ink-2: oklch(0.78 0 0);
+  --ink-3: oklch(0.58 0 0);
+  --line: oklch(1 0 0 / 0.12);
+  --glass: oklch(1 0 0 / 0.05);
+  --glass-2: oklch(1 0 0 / 0.09);
+  --focus: oklch(0.85 0.15 85);
+  --radius: 14px;
+  /* HUD palette (switched by [data-palette]) */
+  --hud-line: oklch(0.97 0 0);
+  --hud-front: oklch(0.82 0.16 75);
+  --hud-rear: oklch(0.78 0.12 230);
+  --hud-scrim: oklch(0.12 0 0 / 0.55);
+  --hud-muted: oklch(0.7 0 0 / 0.5);
+}
+[data-palette="cvd"] {           /* Okabe-Ito orange / sky blue */
+  --hud-front: #E69F00;
+  --hud-rear: #56B4E9;
+}
+[data-palette="contrast"] {
+  --hud-line: #ffffff;
+  --hud-front: #FFE600;
+  --hud-rear: #ffffff;
+  --hud-scrim: oklch(0.05 0 0 / 0.78);
+  --hud-muted: oklch(0.85 0 0 / 0.55);
+}
+* { box-sizing: border-box; }
+html { color-scheme: dark; }
+body {
+  margin: 0;
+  background: radial-gradient(circle at 50% 110%, var(--bg-glow) 0%, var(--bg) 55%) fixed, var(--bg);
+  color: var(--ink);
+  font: 400 13px/1.5 "Geist", "Segoe UI Variable", "Segoe UI", sans-serif;
+}
+.mono { font-family: "Geist Mono", "Cascadia Mono", Consolas, monospace; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 6px; }
+button, input, select { font: inherit; color: inherit; }
+
+/* ---------- page header + tweaks ---------- */
+header.top {
+  max-width: 1480px; margin: 0 auto; padding: 32px 24px 16px;
+  display: grid; grid-template-columns: auto 1fr; gap: 16px 24px; align-items: center;
+}
+.logo-ph {
+  display: grid; place-items: center; width: 44px; height: 44px; border-radius: 10px;
+  border: 1px dashed var(--ink-3); color: var(--ink-3); font-size: 9px; text-align: center; line-height: 1.1;
+}
+header.top h1 { margin: 0; font-size: 28px; font-weight: 600; letter-spacing: -0.02em; }
+header.top p { margin: 2px 0 0; color: var(--ink-2); max-width: 70ch; text-wrap: pretty; }
+.tweaks {
+  position: sticky; top: 0; z-index: 5;
+  background: oklch(0.13 0 0 / 0.92); border-block: 1px solid var(--line);
+}
+.tweaks-inner {
+  max-width: 1480px; margin: 0 auto; padding: 10px 24px;
+  display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: center;
+}
+.tw { display: flex; align-items: center; gap: 8px; }
+.tw > span { color: var(--ink-3); font-size: 12px; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; padding: 2px; background: var(--glass); }
+.seg button {
+  border: 0; background: none; padding: 4px 10px; border-radius: 999px; cursor: pointer; color: var(--ink-2); font-size: 12px;
+}
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--bg); }
+.chk { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); cursor: pointer; }
+.legend { display: flex; gap: 16px; flex-wrap: wrap; align-items: center; font-size: 12px; color: var(--ink-2); }
+.legend canvas { vertical-align: middle; }
+
+/* ---------- concept rows ---------- */
+main { max-width: 1480px; margin: 0 auto; padding: 8px 24px 64px; display: grid; gap: 40px; }
+.concept { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 20px; align-items: start; }
+.concept-head { grid-column: 1 / -1; display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.concept-head .num { font-family: "Geist Mono", monospace; color: var(--ink-3); font-size: 12px; }
+.concept-head h2 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -0.01em; }
+.concept-head .pitch { color: var(--ink-2); }
+.concept-head .tag { font-size: 11px; color: var(--ink-3); border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; }
+.stage-wrap { display: grid; gap: 8px; }
+.stage { position: relative; aspect-ratio: 16 / 9; border-radius: var(--radius); overflow: hidden; border: 1px solid var(--line); background: #000; }
+.stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+.stage-cap { display: flex; justify-content: space-between; gap: 12px; color: var(--ink-3); font-size: 12px; flex-wrap: wrap; }
+.why { margin: 0; padding: 0; list-style: none; display: grid; gap: 4px; color: var(--ink-2); font-size: 12px; }
+.why li::before { content: "— "; color: var(--ink-3); }
+
+/* ---------- shared control bits ---------- */
+.ctl { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; align-items: center; }
+.ctl label { font-size: 13px; }
+.ctl output { font-family: "Geist Mono", monospace; font-size: 12px; color: var(--ink-2); min-width: 4ch; text-align: right; }
+.ctl input[type=range] { grid-column: 1 / -1; width: 100%; accent-color: var(--ink); height: 20px; }
+.btn { border: 1px solid var(--line); background: var(--glass-2); border-radius: 10px; padding: 8px 12px; cursor: pointer; text-align: left; }
+.btn:hover { background: oklch(1 0 0 / 0.14); }
+.status { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; font-size: 12px; }
+.status dt { color: var(--ink-3); }
+.status dd { margin: 0; }
+.pill-ok { color: oklch(0.85 0.13 150); }
+.pill-warn { color: oklch(0.86 0.13 85); }
+.exp { font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-3); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; margin-left: 6px; }
+kbd { font-family: "Geist Mono", monospace; font-size: 11px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; padding: 0 5px; color: var(--ink-2); }
+
+/* 1. Orbit panel: brand glass, tabbed */
+.p-orbit { background: var(--glass); border: 1px solid var(--line); border-radius: 18px; padding: 16px; display: grid; gap: 14px; }
+.p-orbit .head { display: flex; align-items: center; gap: 10px; }
+.p-orbit .head .logo-ph { width: 28px; height: 28px; font-size: 7px; border-radius: 7px; }
+.p-orbit .head h3 { margin: 0; font-size: 15px; font-weight: 600; flex: 1; }
+.p-orbit [role=tablist] { display: grid; grid-template-columns: repeat(4, 1fr); background: oklch(0 0 0 / 0.35); border-radius: 10px; padding: 3px; }
+.p-orbit [role=tab] { border: 0; background: none; padding: 7px 0; border-radius: 8px; cursor: pointer; color: var(--ink-2); font-size: 12px; }
+.p-orbit [role=tab][aria-selected="true"] { background: var(--glass-2); color: var(--ink); box-shadow: inset 0 0 0 1px var(--line); }
+.p-orbit [role=tabpanel][hidden] { display: none; }
+.p-orbit [role=tabpanel] { display: grid; gap: 12px; min-height: 250px; align-content: start; }
+.p-orbit .toggle { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 10px; border-radius: 10px; background: oklch(0 0 0 / 0.25); cursor: pointer; }
+.p-orbit .toggle small { display: block; color: var(--ink-3); font-size: 11px; }
+.p-orbit .presets { display: grid; gap: 6px; }
+.p-orbit .presets label { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); cursor: pointer; }
+.p-orbit .presets label:has(input:checked) { background: var(--glass-2); border-color: oklch(1 0 0 / 0.35); }
+.p-orbit .presets small { color: var(--ink-3); margin-left: auto; font-size: 11px; }
+
+/* 2. Radar panel: dense, technical */
+.p-radar { border: 1px solid var(--line); border-radius: 8px; background: oklch(0.1 0 0 / 0.85); font-family: "Geist Mono", monospace; font-size: 12px; }
+.p-radar .head { display: flex; justify-content: space-between; padding: 8px 12px; border-bottom: 1px solid var(--line); color: var(--ink-2); }
+.p-radar section { padding: 8px 12px 10px; border-bottom: 1px solid var(--line); display: grid; gap: 8px; }
+.p-radar section:last-child { border-bottom: 0; }
+.p-radar h4 { margin: 0; font-size: 10px; font-weight: 500; letter-spacing: 0.1em; color: var(--ink-3); text-transform: uppercase; }
+.p-radar .row { display: grid; grid-template-columns: 110px 1fr 44px; gap: 8px; align-items: center; }
+.p-radar .row output { text-align: right; color: var(--ink-2); }
+.p-radar input[type=range] { width: 100%; accent-color: var(--ink); }
+.p-radar .sw { justify-self: start; border: 1px solid var(--line); border-radius: 4px; background: none; padding: 1px 8px; cursor: pointer; color: var(--ink-3); }
+.p-radar .sw[aria-checked="true"] { color: var(--bg); background: var(--ink); }
+.p-radar .eq { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
+.p-radar .eq label { display: grid; justify-items: center; gap: 2px; color: var(--ink-3); font-size: 10px; }
+.p-radar .eq input { writing-mode: vertical-lr; direction: rtl; height: 72px; width: 20px; accent-color: var(--ink); }
+.p-radar select { background: var(--glass); border: 1px solid var(--line); border-radius: 4px; padding: 2px 4px; }
+
+/* 3. Tape panel: pill bar + sheets */
+.p-tape { display: grid; gap: 8px; }
+.p-tape .bar { display: flex; flex-wrap: wrap; gap: 6px; }
+.p-tape .pill { border: 1px solid var(--line); background: var(--glass); border-radius: 999px; padding: 6px 12px; cursor: pointer; font-size: 12px; display: inline-flex; gap: 6px; align-items: center; }
+.p-tape .pill[aria-expanded="true"] { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+.p-tape .pill .mono { color: inherit; opacity: 0.75; }
+.p-tape .sheet { border: 1px solid var(--line); background: var(--glass); border-radius: 16px; padding: 14px; display: grid; gap: 12px; }
+.p-tape .sheet[hidden] { display: none; }
+.p-tape .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.p-tape .chips label { border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
+.p-tape .chips label:has(input:checked) { background: var(--glass-2); border-color: oklch(1 0 0 / 0.4); }
+.p-tape .chips input, .p-orbit .presets input { accent-color: var(--ink); }
+
+@media (max-width: 1000px) {
+  .concept { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body data-palette="brand">
+
+<header class="top">
+  <div class="logo-ph" aria-label="Logo placeholder">[HWS<br>logo]</div>
+  <div>
+    <h1>HUD concepts</h1>
+    <p>Three look-and-feel directions for the Heroes Without Sound overlay: the in-game HUD plus its settings. The sounds are simulated, but they follow the real DSP's output: direction, loudness, and front/behind (real on 5.1/7.1, guessed on stereo). Try the tweaks. They apply to all three concepts at once.</p>
+  </div>
+</header>
+
+<div class="tweaks" role="region" aria-label="Demo tweaks">
+  <div class="tweaks-inner">
+    <div class="tw"><span id="l-scn">Scenario</span>
+      <div class="seg" role="group" aria-labelledby="l-scn" data-tweak="scenario">
+        <button data-v="calm">Calm</button><button data-v="firefight">Firefight</button><button data-v="behind">Someone behind you</button>
+      </div></div>
+    <div class="tw"><span id="l-lay">Audio</span>
+      <div class="seg" role="group" aria-labelledby="l-lay" data-tweak="layout">
+        <button data-v="stereo">Stereo</button><button data-v="71">7.1</button>
+      </div></div>
+    <label class="chk"><input type="checkbox" data-tweak-check="fb"> Front/back guess (stereo)</label>
+    <div class="tw"><span id="l-pal">Palette</span>
+      <div class="seg" role="group" aria-labelledby="l-pal" data-tweak="palette">
+        <button data-v="brand">Brand</button><button data-v="cvd">Colour-blind</button><button data-v="contrast">High contrast</button>
+      </div></div>
+    <div class="tw"><span id="l-bg">Scene</span>
+      <div class="seg" role="group" aria-labelledby="l-bg" data-tweak="bg">
+        <button data-v="angle">Scope</button><button data-v="win">Bright hall</button><button data-v="dark">Plain</button>
+      </div></div>
+    <div class="tw"><span id="l-view">View</span>
+      <div class="seg" role="group" aria-labelledby="l-view" data-tweak="view">
+        <button data-v="close">Close-up</button><button data-v="screen">Whole screen</button>
+      </div></div>
+    <label class="chk"><input type="checkbox" data-tweak-check="bounds"> Window bounds</label>
+    <label class="chk"><input type="checkbox" data-tweak-check="paused"> Pause</label>
+    <div class="legend" aria-label="Legend">
+      <span><canvas data-legend="front" width="44" height="22"></canvas> Front</span>
+      <span><canvas data-legend="real" width="44" height="22"></canvas> Behind (5.1/7.1)</span>
+      <span><canvas data-legend="guess" width="44" height="22"></canvas> Behind, guessed</span>
+      <span><canvas data-legend="loud" width="44" height="22"></canvas> Bigger = louder</span>
+    </div>
+  </div>
+</div>
+
+<main>
+  <!-- ======================= 1. ORBIT ======================= -->
+  <section class="concept" data-concept="orbit" aria-labelledby="h-orbit">
+    <div class="concept-head">
+      <span class="num">01</span><h2 id="h-orbit">Orbit</h2>
+      <span class="pitch">An evolution of today's sphere and ring: lighter, smaller, and readable.</span>
+      <span class="tag">Conservative</span>
+    </div>
+    <div class="stage-wrap">
+      <div class="stage"><canvas aria-label="Orbit HUD preview"></canvas></div>
+      <div class="stage-cap"><span>Window 240 × 240 px, below the crosshair</span><span data-cap></span></div>
+      <ul class="why">
+        <li>Keeps the brand's 3D identity, but the dotted sphere becomes a faint wireframe, so it stops competing with the game's white HUD.</li>
+        <li>F/R/B/L ticks, plus a chevron shape for front/behind. Direction never relies on colour.</li>
+        <li>40% of today's footprint, with a dark scrim so it stays readable on bright walls.</li>
+      </ul>
+    </div>
+    <div class="p-orbit" role="group" aria-label="Orbit settings">
+      <div class="head"><div class="logo-ph">[HWS]</div><h3>Settings</h3><kbd>Alt+I</kbd></div>
+      <div role="tablist" aria-label="Settings sections">
+        <button role="tab" aria-selected="true" aria-controls="o-display" id="ot-display">Display</button>
+        <button role="tab" aria-selected="false" aria-controls="o-sound" id="ot-sound" tabindex="-1">Sound</button>
+        <button role="tab" aria-selected="false" aria-controls="o-presets" id="ot-presets" tabindex="-1">Presets</button>
+        <button role="tab" aria-selected="false" aria-controls="o-setup" id="ot-setup" tabindex="-1">Setup</button>
+      </div>
+      <div role="tabpanel" id="o-display" aria-labelledby="ot-display">
+        <div class="ctl"><label for="o-size">Size</label><output data-out="orbit.scale"></output><input id="o-size" type="range" min="0.6" max="1.6" step="0.05" data-bind="orbit.scale"></div>
+        <div class="ctl"><label for="o-op">Opacity</label><output data-out="orbit.opacity"></output><input id="o-op" type="range" min="0.3" max="1" step="0.05" data-bind="orbit.opacity"></div>
+        <label class="toggle"><span>Show the orb<small>Turn off for a ring-only HUD</small></span><input type="checkbox" data-bind-check="orbit.orb"></label>
+      </div>
+      <div role="tabpanel" id="o-sound" aria-labelledby="ot-sound" hidden>
+        <div class="ctl"><label for="o-sens">Sensitivity</label><output data-out="orbit.sens"></output><input id="o-sens" type="range" min="0.5" max="2" step="0.05" data-bind="orbit.sens"></div>
+        <label class="toggle"><span>Swap left / right<small>If sides look reversed</small></span><input type="checkbox" data-bind-check="swap"></label>
+        <label class="toggle"><span>Guess front / back<span class="exp">Experimental</span><small>Stereo 3D-audio games only. Shows "behind" only when confident.</small></span><input type="checkbox" data-bind-check="fb"></label>
+      </div>
+      <div role="tabpanel" id="o-presets" aria-labelledby="ot-presets" hidden>
+        <div class="presets" role="radiogroup" aria-label="Game preset">
+          <label><input type="radio" name="o-pre" value="none" checked> None <small>Neutral</small></label>
+          <label><input type="radio" name="o-pre" value="cs2"> CS2 <small>Mids up</small></label>
+          <label><input type="radio" name="o-pre" value="r6"> Rainbow Six Siege <small>Footsteps up</small></label>
+          <label><input type="radio" name="o-pre" value="cod"> Call of Duty <small>Lows up</small></label>
+        </div>
+      </div>
+      <div role="tabpanel" id="o-setup" aria-labelledby="ot-setup" hidden>
+        <dl class="status" data-status></dl>
+        <button class="btn" type="button">Open Windows sound settings</button>
+        <button class="btn" type="button" data-test-lr>Test left / right</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= 2. RADAR ======================= -->
+  <section class="concept" data-concept="radar" aria-labelledby="h-radar">
+    <div class="concept-head">
+      <span class="num">02</span><h2 id="h-radar">Radar</h2>
+      <span class="pitch">A flat top-down disc: you're in the middle, and sectors light up toward sounds.</span>
+      <span class="tag">Middle ground</span>
+    </div>
+    <div class="stage-wrap">
+      <div class="stage"><canvas aria-label="Radar HUD preview"></canvas></div>
+      <div class="stage-cap"><span data-radar-cap>Window 200 × 200 px, lower centre</span><span data-cap></span></div>
+      <ul class="why">
+        <li>The easiest mental model: top-down like a minimap, with 16 sectors and numbered bearings.</li>
+        <li>Wedge length is loudness, with rings as the scale. Behind-you wedges are hatched, not just recoloured.</li>
+        <li>Crosshair mode shrinks it to thin arcs around the aim point, so your eyes never leave the action.</li>
+      </ul>
+    </div>
+    <div class="p-radar" role="group" aria-label="Radar settings">
+      <div class="head"><span>DEAFOVERLAY / SETTINGS</span><kbd>Alt+I</kbd></div>
+      <section>
+        <h4>Display</h4>
+        <div class="row"><span id="r-mode-l">Mode</span>
+          <div class="seg" role="group" aria-labelledby="r-mode-l" data-bind-seg="radar.mode"><button data-v="disc">Disc</button><button data-v="cross">Crosshair</button></div><span></span></div>
+        <div class="row"><label for="r-size">Size</label><input id="r-size" type="range" min="0.6" max="1.6" step="0.05" data-bind="radar.scale"><output data-out="radar.scale"></output></div>
+        <div class="row"><label for="r-op">Opacity</label><input id="r-op" type="range" min="0.3" max="1" step="0.05" data-bind="radar.opacity"><output data-out="radar.opacity"></output></div>
+      </section>
+      <section>
+        <h4>Sound</h4>
+        <div class="row"><label for="r-sens">Sensitivity</label><input id="r-sens" type="range" min="0.5" max="2" step="0.05" data-bind="radar.sens"><output data-out="radar.sens"></output></div>
+        <div class="eq" aria-label="Band gains (tune detection in the app)">
+          <label>BASS<input type="range" min="0" max="3" step="0.05" value="1" aria-label="Bass gain"></label>
+          <label>LOW<input type="range" min="0" max="3" step="0.05" value="1" aria-label="Low-mid gain"></label>
+          <label>MID<input type="range" min="0" max="3" step="0.05" value="1" aria-label="Mid gain"></label>
+          <label>HIGH<input type="range" min="0" max="3" step="0.05" value="1" aria-label="High-mid gain"></label>
+          <label>AIR<input type="range" min="0" max="3" step="0.05" value="1" aria-label="Air gain"></label>
+        </div>
+        <div class="row"><span id="r-swap-l">Swap L/R</span><button class="sw" role="switch" aria-labelledby="r-swap-l" data-bind-switch="swap"></button><span></span></div>
+        <div class="row"><span id="r-fb-l">Front/back?</span><button class="sw" role="switch" aria-labelledby="r-fb-l" data-bind-switch="fb"></button><span class="exp" style="justify-self:end">exp</span></div>
+        <div class="row"><label for="r-pre">Preset</label><select id="r-pre"><option>None</option><option>CS2</option><option>Rainbow Six Siege</option><option>Call of Duty</option></select><span></span></div>
+      </section>
+      <section>
+        <h4>Setup</h4>
+        <dl class="status" data-status></dl>
+        <div class="row"><span>Self-test</span><button class="sw" type="button" data-test-lr>RUN L/R</button><span></span></div>
+      </section>
+    </div>
+  </section>
+
+  <!-- ======================= 3. TAPE ======================= -->
+  <section class="concept" data-concept="tape" aria-labelledby="h-tape">
+    <div class="concept-head">
+      <span class="num">03</span><h2 id="h-tape">Compass tape</h2>
+      <span class="pitch">A thin 360° bearing strip under the game's top HUD. Nothing covers the action.</span>
+      <span class="tag">Novel</span>
+    </div>
+    <div class="stage-wrap">
+      <div class="stage"><canvas aria-label="Compass tape HUD preview"></canvas></div>
+      <div class="stage-cap"><span>Window 520 × 72 px, top centre</span><span data-cap></span></div>
+      <ul class="why">
+        <li>Front at the centre, BEHIND at both ends. Shooter players already read compass tapes, so it's a familiar pattern.</li>
+        <li>On stereo the rear of the tape is greyed out and labelled. It says plainly what stereo can't know, instead of hiding it.</li>
+        <li>The smallest footprint of the three, and it sits where the eye already checks the score and timer.</li>
+      </ul>
+    </div>
+    <div class="p-tape" role="group" aria-label="Compass tape settings">
+      <div class="bar">
+        <button class="pill" aria-expanded="false" aria-controls="t-status" data-sheet>Status <span class="mono" data-layout-short></span></button>
+        <button class="pill" aria-expanded="true" aria-controls="t-display" data-sheet>Display</button>
+        <button class="pill" aria-expanded="false" aria-controls="t-sound" data-sheet>Sound</button>
+        <button class="pill" aria-expanded="false" aria-controls="t-preset" data-sheet>Preset <span class="mono">None</span></button>
+      </div>
+      <div class="sheet" id="t-status" hidden>
+        <dl class="status" data-status></dl>
+        <button class="btn" type="button" data-test-lr>Test left / right</button>
+      </div>
+      <div class="sheet" id="t-display">
+        <div class="ctl"><label for="t-size">Size</label><output data-out="tape.scale"></output><input id="t-size" type="range" min="0.6" max="1.6" step="0.05" data-bind="tape.scale"></div>
+        <div class="ctl"><label for="t-op">Opacity</label><output data-out="tape.opacity"></output><input id="t-op" type="range" min="0.3" max="1" step="0.05" data-bind="tape.opacity"></div>
+      </div>
+      <div class="sheet" id="t-sound" hidden>
+        <div class="ctl"><label for="t-sens">Sensitivity</label><output data-out="tape.sens"></output><input id="t-sens" type="range" min="0.5" max="2" step="0.05" data-bind="tape.sens"></div>
+        <div class="chips">
+          <label><input type="checkbox" data-bind-check="swap"> Swap L/R</label>
+          <label><input type="checkbox" data-bind-check="fb"> Guess front/back <span class="exp">exp</span></label>
+        </div>
+      </div>
+      <div class="sheet" id="t-preset" hidden>
+        <div class="chips" role="radiogroup" aria-label="Game preset">
+          <label><input type="radio" name="t-pre" checked> None</label>
+          <label><input type="radio" name="t-pre"> CS2</label>
+          <label><input type="radio" name="t-pre"> Rainbow Six Siege</label>
+          <label><input type="radio" name="t-pre"> Call of Duty</label>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+// ---------------------------------------------------------------- state
+const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const S = {
+  scenario: "firefight", layout: "stereo", fb: false, palette: "brand", bg: "angle",
+  view: "close", bounds: true, paused: reduced, swap: false,
+  orbit: { scale: 1, opacity: 1, sens: 1, orb: true },
+  radar: { scale: 1, opacity: 1, sens: 1, mode: "disc" },
+  tape:  { scale: 1, opacity: 1, sens: 1 },
+};
+// Any tweak can be preset from the URL, e.g. #layout=71&scenario=behind&palette=cvd&view=screen
+for (const [k, v] of new URLSearchParams(location.hash.slice(1))) {
+  if (!(k in S) || typeof S[k] === "object") continue;
+  S[k] = typeof S[k] === "boolean" ? v === "1" || v === "true" : typeof S[k] === "number" ? Number(v) : v;
+}
+const get = (path) => path.split(".").reduce((o, k) => o[k], S);
+const set = (path, v) => { const ks = path.split("."); const last = ks.pop(); ks.reduce((o, k) => o[k], S)[last] = v; };
+
+// ---------------------------------------------------------------- simulation
+// Emitters fire events; each keeps a level that decays like the app's tracker (~0.35 s).
+// "guessable": a rear sound the stereo front/back model would flag (it misses many, see phase 6).
+const SCENES = {
+  calm: [
+    { id: "steps", kind: "walk", from: -40, to: -70, period: 9, step: 0.55, amp: 0.35 },
+    { id: "door", kind: "burst", az: 70, every: 6.5, shots: 1, amp: 0.55 },
+    { id: "far", kind: "walk", from: 150, to: 120, period: 12, step: 0.7, amp: 0.25, guessable: true },
+  ],
+  firefight: [
+    { id: "gun", kind: "burst", az: 35, every: 2.6, shots: 5, gap: 0.09, amp: 0.95 },
+    { id: "boom", kind: "burst", az: -125, every: 5.2, shots: 1, amp: 0.8, decay: 0.7 },
+    { id: "steps", kind: "walk", from: -150, to: -95, period: 7, step: 0.45, amp: 0.5, guessable: true },
+    { id: "ally", kind: "walk", from: 10, to: -20, period: 8, step: 0.5, amp: 0.3 },
+  ],
+  behind: [
+    { id: "stalker", kind: "walk", from: 172, to: 138, period: 6, step: 0.42, amp: 0.3, ramp: 0.95, guessable: true },
+    { id: "front", kind: "walk", from: -30, to: -45, period: 10, step: 0.6, amp: 0.25 },
+  ],
+};
+const levels = new Map();   // id -> {az, level, decay, guessable}
+let simT = 0, testT = -1;
+
+function emit(id, az, amp, decay = 0.35, guessable = false) {
+  const e = levels.get(id) || { level: 0 };
+  e.az = az; e.level = Math.max(e.level, amp); e.decay = decay; e.guessable = guessable;
+  levels.set(id, e);
+}
+function stepSim(dt) {
+  const t0 = simT; simT += dt;
+  const crossed = (period, offset = 0) => Math.floor((simT - offset) / period) > Math.floor((t0 - offset) / period);
+  for (const em of SCENES[S.scenario]) {
+    if (em.kind === "walk") {
+      const ph = (simT % em.period) / em.period;
+      const az = em.from + (em.to - em.from) * ph;
+      const amp = em.ramp ? em.amp + (em.ramp - em.amp) * ph : em.amp;
+      if (crossed(em.step)) emit(em.id, az, amp, 0.3, em.guessable);
+      else if (levels.has(em.id)) levels.get(em.id).az = az;
+    } else {
+      for (let k = 0; k < em.shots; k++) if (crossed(em.every, k * (em.gap || 0))) emit(em.id, em.az + (k % 2 ? 2 : -2), em.amp, em.decay || 0.3);
+    }
+  }
+  if (testT >= 0) {   // L/R self-test: beeps left, then right (like the app's tone)
+    testT += dt;
+    const side = testT < 1.5 ? -90 : testT < 3 ? 90 : null;
+    if (side === null) testT = -1;
+    else if (crossed(0.25)) emit("test", side, 0.9, 0.2);
+  }
+  for (const [id, e] of levels) { e.level *= Math.exp(-dt / e.decay); if (e.level < 0.03) levels.delete(id); }
+}
+
+// What the HUD is allowed to show, given the audio layout (mirrors the real pipeline).
+function visible(sens) {
+  const out = [];
+  for (const e of levels.values()) {
+    let az = S.swap ? -e.az : e.az;
+    const s = Math.min(1, e.level * sens);
+    const behind = Math.abs(az) > 90;
+    if (S.layout === "71") out.push({ az, s, rear: behind ? "real" : "none" });
+    else if (!behind) out.push({ az, s, rear: "none" });
+    else if (S.fb && e.guessable) out.push({ az, s, rear: "guess" });
+    else out.push({ az: Math.sign(az) * (180 - Math.abs(az)), s, rear: "none" }); // folded onto the front arc
+  }
+  return out.sort((a, b) => a.s - b.s);   // loudest drawn last (on top)
+}
+
+// ---------------------------------------------------------------- drawing kit
+const css = (name) => getComputedStyle(document.body).getPropertyValue(name).trim();
+let P = {};
+function readPalette() {
+  P = { line: css("--hud-line"), front: css("--hud-front"), rear: css("--hud-rear"), scrim: css("--hud-scrim"), muted: css("--hud-muted") };
+}
+const rad = (d) => (d * Math.PI) / 180;
+const colorOf = (src) => (src.rear === "none" ? P.front : P.rear);
+
+/** Chevron pointing along `dir` (radians, canvas space). Shape carries front/behind. */
+function chevron(ctx, x, y, dir, size, rear, alpha = 1) {
+  ctx.save();
+  ctx.translate(x, y); ctx.rotate(dir); ctx.globalAlpha *= alpha;
+  ctx.beginPath();
+  ctx.moveTo(size, 0); ctx.lineTo(-size * 0.7, size * 0.8); ctx.lineTo(-size * 0.25, 0); ctx.lineTo(-size * 0.7, -size * 0.8); ctx.closePath();
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = "rgba(0,0,0,0.75)"; ctx.lineWidth = 3.5; ctx.stroke();       // outline: survives bright scenes
+  const c = rear === "none" ? P.front : P.rear;
+  if (rear === "none") { ctx.fillStyle = c; ctx.fill(); }
+  else {
+    if (rear === "guess") ctx.setLineDash([3, 2.5]);
+    ctx.strokeStyle = c; ctx.lineWidth = 2; ctx.stroke();
+  }
+  ctx.restore();
+}
+function label(ctx, text, x, y, color, size = 11, align = "center") {
+  ctx.save();
+  ctx.font = `500 ${size}px "Geist Mono", monospace`;
+  ctx.textAlign = align; ctx.textBaseline = "middle";
+  ctx.lineWidth = 3; ctx.strokeStyle = "rgba(0,0,0,0.8)"; ctx.strokeText(text, x, y);
+  ctx.fillStyle = color; ctx.fillText(text, x, y);
+  ctx.restore();
+}
+function rearTag(ctx, src, x, y) {
+  if (src.rear === "real") label(ctx, "BEHIND", x, y, P.rear, 10);
+  if (src.rear === "guess") label(ctx, "BEHIND?", x, y, P.rear, 10);
+}
+function scrimEllipse(ctx, x, y, rx, ry) {
+  const g = ctx.createRadialGradient(x, y, 0, x, y, 1);
+  g.addColorStop(0, P.scrim); g.addColorStop(0.75, P.scrim); g.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.save(); ctx.translate(x, y); ctx.scale(rx, ry); ctx.translate(-x, -y);
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, 1, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+}
+function roundRect(ctx, x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); }
+
+// ---------------------------------------------------------------- concept 1: Orbit
+const orbit = {
+  box() { const k = S.orbit.scale; return { cx: 960, cy: 790, w: 240 * k, h: 240 * k }; },
+  draw(ctx) {
+    const k = S.orbit.scale, { cx, cy } = this.box();
+    const srcs = visible(S.orbit.sens);
+    ctx.globalAlpha = S.orbit.opacity;
+    const oy = cy - 42 * k, R = 44 * k;          // orb
+    const ry0 = cy + 44 * k, rx = 100 * k, ry = 36 * k;   // ring
+    scrimEllipse(ctx, cx, cy + 8 * k, 122 * k, 118 * k);
+
+    if (S.orbit.orb) {
+      ctx.save();
+      ctx.strokeStyle = P.line; ctx.lineWidth = 1;
+      ctx.globalAlpha *= 0.28;
+      ctx.beginPath(); ctx.arc(cx, oy, R, 0, Math.PI * 2); ctx.stroke();
+      for (const f of [-0.55, 0, 0.55]) { ctx.beginPath(); ctx.ellipse(cx, oy + f * R, R * Math.sqrt(1 - f * f), R * 0.28 * Math.sqrt(1 - f * f), 0, 0, Math.PI * 2); ctx.stroke(); }
+      for (const f of [0.35, 0.75]) { ctx.beginPath(); ctx.ellipse(cx, oy, R * f, R, 0, 0, Math.PI * 2); ctx.stroke(); }
+      ctx.restore();
+      // the orb's surface lights up toward the loudest sound (front hemisphere bright, rear dim)
+      const top = srcs[srcs.length - 1];
+      if (top) {
+        const a = rad(top.az), fx = cx + Math.sin(a) * R * 0.72, fy = oy - Math.cos(a) * R * 0.3;
+        const g = ctx.createRadialGradient(fx, fy, 0, fx, fy, R * 0.75);
+        g.addColorStop(0, colorOf(top)); g.addColorStop(1, "rgba(0,0,0,0)");
+        ctx.save(); ctx.globalAlpha *= (top.rear === "none" ? 0.55 : 0.3) * top.s;
+        ctx.fillStyle = g; ctx.beginPath(); ctx.arc(cx, oy, R, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+      }
+    }
+
+    // ring + F/R/B/L
+    ctx.save(); ctx.strokeStyle = P.line; ctx.globalAlpha *= 0.7; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.ellipse(cx, ry0, rx, ry, 0, 0, Math.PI * 2); ctx.stroke(); ctx.restore();
+    const pt = (az, grow = 0) => [cx + (rx + grow) * Math.sin(rad(az)), ry0 - (ry + grow * 0.36) * Math.cos(rad(az))];
+    for (const [az, t] of [[0, "F"], [90, "R"], [180, "B"], [-90, "L"]]) {
+      const [x, y] = pt(az, 14 * k);
+      const dim = S.layout === "stereo" && az === 180 && !S.fb;
+      label(ctx, t, x, y, dim ? P.muted : P.line, 10 * Math.max(1, k));
+    }
+    // arcs + chevrons
+    for (const src of srcs) {
+      const span = 14 + 36 * src.s;
+      ctx.save(); ctx.strokeStyle = colorOf(src); ctx.lineCap = "round";
+      ctx.lineWidth = (2 + 6 * src.s) * k; ctx.globalAlpha *= 0.35 + 0.65 * src.s;
+      if (src.rear === "guess") ctx.setLineDash([4 * k, 4 * k]);
+      ctx.beginPath();
+      for (let d = -span / 2; d <= span / 2; d += 2) { const [x, y] = pt(src.az + d); d === -span / 2 ? ctx.moveTo(x, y) : ctx.lineTo(x, y); }
+      ctx.stroke(); ctx.restore();
+      const [x, y] = pt(src.az, (10 + 6 * src.s) * k);
+      const dir = Math.atan2(-Math.cos(rad(src.az)) / ry, Math.sin(rad(src.az)) / rx); // ellipse outward normal
+      chevron(ctx, x, y, dir, (6 + 7 * src.s) * k, src.rear, 0.5 + 0.5 * src.s);
+      if (src.rear !== "none") rearTag(ctx, src, x, y + 16 * k);
+    }
+    ctx.globalAlpha = 1;
+  },
+};
+
+// ---------------------------------------------------------------- concept 2: Radar
+const hatchCache = {};
+function hatch(ctx, color) {
+  if (!hatchCache[color]) {
+    const c = document.createElement("canvas"); c.width = c.height = 8;
+    const g = c.getContext("2d"); g.strokeStyle = color; g.lineWidth = 2;
+    g.beginPath(); g.moveTo(-2, 10); g.lineTo(10, -2); g.stroke();
+    hatchCache[color] = c;
+  }
+  return ctx.createPattern(hatchCache[color], "repeat");
+}
+const radar = {
+  box() {
+    const k = S.radar.scale;
+    return S.radar.mode === "cross" ? { cx: 960, cy: 540, w: 180 * k, h: 180 * k } : { cx: 960, cy: 830, w: 200 * k, h: 200 * k };
+  },
+  draw(ctx) {
+    const k = S.radar.scale, { cx, cy } = this.box();
+    const srcs = visible(S.radar.sens);
+    ctx.globalAlpha = S.radar.opacity;
+    if (S.radar.mode === "cross") return this.cross(ctx, cx, cy, k, srcs);
+    const R = 86 * k, r0 = 12 * k;
+    ctx.fillStyle = P.scrim; ctx.beginPath(); ctx.arc(cx, cy, R + 8 * k, 0, Math.PI * 2); ctx.fill();
+    // stereo: the rear half is unknown, so it's shaded and labelled rather than left blank
+    if (S.layout === "stereo") {
+      ctx.save(); ctx.fillStyle = hatch(ctx, "rgba(255,255,255,0.07)");
+      ctx.beginPath(); ctx.moveTo(cx, cy); ctx.arc(cx, cy, R, 0, Math.PI); ctx.closePath(); ctx.fill(); ctx.restore();
+      label(ctx, S.fb ? "rear: guess only" : "rear needs 7.1", cx, cy + R + 2 * k, P.muted, 9);   // on the rim, clear of rear tags
+    }
+    ctx.save(); ctx.strokeStyle = P.line; ctx.lineWidth = 1;
+    for (const f of [0.33, 0.66, 1]) { ctx.globalAlpha = S.radar.opacity * (f === 1 ? 0.55 : 0.18); ctx.beginPath(); ctx.arc(cx, cy, r0 + (R - r0) * f, 0, Math.PI * 2); ctx.stroke(); }
+    ctx.globalAlpha = S.radar.opacity * 0.12;
+    for (let i = 0; i < 16; i++) { const a = rad(i * 22.5 - 90); ctx.beginPath(); ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0); ctx.lineTo(cx + Math.cos(a) * R, cy + Math.sin(a) * R); ctx.stroke(); }
+    ctx.restore();
+    ctx.globalAlpha = S.radar.opacity;
+    for (const [az, t] of [[0, "000"], [90, "090"], [180, "180"], [270, "270"]]) {
+      const a = rad(az - 90); label(ctx, t, cx + Math.cos(a) * (R + 16 * k), cy + Math.sin(a) * (R + 16 * k), P.muted, 9 * Math.max(1, k));
+    }
+    // loudest source per sector
+    const sec = new Map();
+    for (const s of srcs) { const i = ((Math.round(s.az / 22.5) % 16) + 16) % 16; if (!sec.has(i) || sec.get(i).s < s.s) sec.set(i, s); }
+    for (const [i, s] of sec) {
+      const a0 = rad(i * 22.5 - 90 - 10), a1 = rad(i * 22.5 - 90 + 10), rr = r0 + (R - r0) * (0.25 + 0.75 * s.s);
+      ctx.beginPath(); ctx.arc(cx, cy, rr, a0, a1); ctx.arc(cx, cy, r0, a1, a0, true); ctx.closePath();
+      ctx.save(); ctx.globalAlpha *= 0.45 + 0.55 * s.s;
+      if (s.rear === "none") { ctx.fillStyle = P.front; ctx.fill(); }
+      else if (s.rear === "real") { ctx.fillStyle = hatch(ctx, P.rear); ctx.fill(); ctx.strokeStyle = P.rear; ctx.lineWidth = 1.5; ctx.stroke(); }
+      else { ctx.setLineDash([3, 3]); ctx.strokeStyle = P.rear; ctx.lineWidth = 1.5; ctx.stroke(); }
+      ctx.restore();
+      if (s.rear !== "none") { const am = rad(i * 22.5 - 90); rearTag(ctx, s, cx + Math.cos(am) * (rr + 12 * k), cy + Math.sin(am) * (rr + 12 * k)); }
+    }
+    // you: a small triangle facing front
+    ctx.fillStyle = P.line; ctx.beginPath(); ctx.moveTo(cx, cy - 7 * k); ctx.lineTo(cx + 5 * k, cy + 5 * k); ctx.lineTo(cx - 5 * k, cy + 5 * k); ctx.closePath(); ctx.fill();
+    ctx.globalAlpha = 1;
+  },
+  cross(ctx, cx, cy, k, srcs) {
+    const R = 64 * k;
+    for (const s of srcs) {
+      const a = rad(s.az - 90), span = rad(10 + 22 * s.s);
+      ctx.save(); ctx.lineCap = "round";
+      ctx.strokeStyle = "rgba(0,0,0,0.7)"; ctx.lineWidth = (3 + 5 * s.s) * k + 3;
+      ctx.beginPath(); ctx.arc(cx, cy, R, a - span, a + span); ctx.stroke();
+      ctx.strokeStyle = colorOf(s); ctx.lineWidth = (3 + 5 * s.s) * k; ctx.globalAlpha *= 0.5 + 0.5 * s.s;
+      if (s.rear !== "none") ctx.setLineDash(s.rear === "guess" ? [3, 4] : [8, 3]);
+      ctx.beginPath(); ctx.arc(cx, cy, R, a - span, a + span); ctx.stroke(); ctx.restore();
+      if (s.rear !== "none") rearTag(ctx, s, cx + Math.cos(a) * (R + 18 * k), cy + Math.sin(a) * (R + 18 * k));
+    }
+    ctx.globalAlpha = 1;
+  },
+};
+
+// ---------------------------------------------------------------- concept 3: Compass tape
+const tape = {
+  box() { const k = S.tape.scale; return { cx: 960, cy: 205, w: 520 * k, h: 72 * k }; },
+  draw(ctx) {
+    const k = S.tape.scale, { cx, cy } = this.box();
+    const W = 480 * k, H = 44 * k, x0 = cx - W / 2, top = cy - H / 2;
+    const X = (az) => cx + (az / 180) * (W / 2);
+    const srcs = visible(S.tape.sens);
+    ctx.globalAlpha = S.tape.opacity;
+    ctx.fillStyle = P.scrim; roundRect(ctx, x0 - 16 * k, top - 8 * k, W + 32 * k, H + 22 * k, 10 * k); ctx.fill();
+    if (S.layout === "stereo") {    // rear quarters: unknown on stereo
+      ctx.save(); ctx.fillStyle = hatch(ctx, "rgba(255,255,255,0.08)");
+      ctx.fillRect(x0, top, X(-90) - x0, H); ctx.fillRect(X(90), top, x0 + W - X(90), H); ctx.restore();
+      const note = S.fb ? "guess only" : "rear needs 7.1";
+      label(ctx, note, (x0 + X(-90)) / 2, top + H * 0.72, P.muted, 9 * Math.max(1, k));
+      label(ctx, note, (X(90) + x0 + W) / 2, top + H * 0.72, P.muted, 9 * Math.max(1, k));
+    }
+    ctx.save(); ctx.strokeStyle = P.line;
+    for (let az = -180; az <= 180; az += 15) {
+      const major = az % 45 === 0;
+      ctx.globalAlpha = S.tape.opacity * (major ? 0.6 : 0.25); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(X(az), top); ctx.lineTo(X(az), top + (major ? 8 : 4) * k); ctx.stroke();
+    }
+    ctx.restore(); ctx.globalAlpha = S.tape.opacity;
+    for (const [az, t] of [[-180, "B"], [-90, "L"], [0, "F"], [90, "R"], [180, "B"]]) label(ctx, t, X(az), top + 16 * k, az === 0 ? P.line : P.muted, 10 * Math.max(1, k));
+    // centre notch = where you face
+    ctx.fillStyle = P.line; ctx.beginPath(); ctx.moveTo(cx, top + H + 2 * k); ctx.lineTo(cx - 5 * k, top + H + 9 * k); ctx.lineTo(cx + 5 * k, top + H + 9 * k); ctx.closePath(); ctx.fill();
+    for (const s of srcs) {
+      const x = X(s.az), h = (8 + 24 * s.s) * k, w = (3 + 4 * s.s) * k, yb = top + H;
+      ctx.save(); ctx.globalAlpha *= 0.45 + 0.55 * s.s;
+      ctx.fillStyle = "rgba(0,0,0,0.7)"; ctx.fillRect(x - w / 2 - 1.5, yb - h - 1.5, w + 3, h + 3);
+      if (s.rear === "none") { ctx.fillStyle = P.front; ctx.fillRect(x - w / 2, yb - h, w, h); }
+      else { if (s.rear === "guess") ctx.setLineDash([3, 2]); ctx.strokeStyle = P.rear; ctx.lineWidth = 1.5; ctx.strokeRect(x - w / 2, yb - h, w, h); }
+      ctx.restore();
+      chevron(ctx, x, yb - h - 7 * k, Math.PI / 2, (4 + 3 * s.s) * k, s.rear, 0.5 + 0.5 * s.s);
+      if (s.rear === "guess") label(ctx, "?", x + 9 * k, yb - h - 7 * k, P.rear, 10);
+    }
+    ctx.globalAlpha = 1;
+  },
+};
+
+// ---------------------------------------------------------------- stages
+const IMG = { angle: new Image(), win: new Image() };
+IMG.angle.src = "media/Siege_angle.png"; IMG.win.src = "media/Siege_win.png";
+const stages = [...document.querySelectorAll(".concept")].map((sec) => ({
+  sec, canvas: sec.querySelector(".stage canvas"), hud: { orbit, radar, tape }[sec.dataset.concept],
+}));
+
+function drawStage(st) {
+  const c = st.canvas, dpr = devicePixelRatio || 1;
+  const w = c.clientWidth, h = c.clientHeight;
+  if (c.width !== Math.round(w * dpr)) { c.width = Math.round(w * dpr); c.height = Math.round(h * dpr); }
+  const ctx = c.getContext("2d");
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, c.width, c.height);
+  // virtual 1920x1080 screen -> canvas; close-up zooms on the HUD window
+  const box = st.hud.box();
+  let s = w / 1920, ox = 0, oy = 0;
+  if (S.view === "close") {
+    s = Math.min(1.7, (w * 0.8) / box.w, (h * 0.8) / box.h);
+    ox = w / 2 - box.cx * s; oy = h / 2 - box.cy * s;
+  }
+  ctx.setTransform(dpr * s, 0, 0, dpr * s, dpr * ox, dpr * oy);
+  const img = IMG[S.bg];
+  if (img && img.complete && img.naturalWidth) { ctx.drawImage(img, 0, 0, 1920, 1080); ctx.fillStyle = "rgba(0,0,0,0.12)"; ctx.fillRect(0, 0, 1920, 1080); }
+  else { ctx.fillStyle = "#101012"; ctx.fillRect(0, 0, 1920, 1080); }
+  st.hud.draw(ctx);
+  if (S.bounds) {
+    ctx.save(); ctx.setLineDash([6 / s, 5 / s]); ctx.strokeStyle = "rgba(255,255,255,0.45)"; ctx.lineWidth = 1 / s;
+    ctx.strokeRect(box.cx - box.w / 2, box.cy - box.h / 2, box.w, box.h); ctx.restore();
+  }
+  st.sec.querySelector("[data-cap]").textContent =
+    S.bg === "dark" ? "" : "Old v1 HUD visible at the right of this capture";
+}
+
+// ---------------------------------------------------------------- legend
+function drawLegend() {
+  for (const c of document.querySelectorAll("[data-legend]")) {
+    const ctx = c.getContext("2d"); ctx.clearRect(0, 0, c.width, c.height);
+    const kind = c.dataset.legend;
+    if (kind === "loud") { chevron(ctx, 10, 11, 0, 4, "none", 0.6); chevron(ctx, 30, 11, 0, 8, "none"); }
+    else chevron(ctx, 22, 11, 0, 7, kind === "front" ? "none" : kind);
+  }
+}
+
+// ---------------------------------------------------------------- controls
+function syncControls() {
+  document.body.dataset.palette = S.palette;
+  readPalette();
+  for (const g of document.querySelectorAll("[data-tweak]")) for (const b of g.querySelectorAll("button")) b.setAttribute("aria-pressed", String(S[g.dataset.tweak] === b.dataset.v));
+  for (const g of document.querySelectorAll("[data-bind-seg]")) for (const b of g.querySelectorAll("button")) b.setAttribute("aria-pressed", String(get(g.dataset.bindSeg) === b.dataset.v));
+  for (const i of document.querySelectorAll("[data-tweak-check]")) i.checked = S[i.dataset.tweakCheck];
+  for (const i of document.querySelectorAll("[data-bind-check]")) i.checked = get(i.dataset.bindCheck);
+  for (const b of document.querySelectorAll("[data-bind-switch]")) { const on = get(b.dataset.bindSwitch); b.setAttribute("aria-checked", String(on)); b.textContent = on ? "ON" : "OFF"; }
+  for (const i of document.querySelectorAll("[data-bind]")) i.value = get(i.dataset.bind);
+  for (const o of document.querySelectorAll("[data-out]")) o.value = Number(get(o.dataset.out)).toFixed(2) + (o.dataset.out.endsWith("opacity") ? "" : "×");
+  const st = S.layout === "71"
+    ? [["Output", "7.1 surround · 8 ch", "ok"], ["Direction", "Full 360°, front and back", "ok"]]
+    : [["Output", "Stereo · 2 ch", ""], ["Direction", S.fb ? "Front arc, plus a behind guess" : "Front arc only", "warn"]];
+  st.push(["Capturing", "All system audio (Alt+G: game only)", ""]);
+  for (const dl of document.querySelectorAll("[data-status]"))
+    dl.innerHTML = st.map(([k, v, c]) => `<dt>${k}</dt><dd class="${c ? "pill-" + c : ""}">${v}</dd>`).join("");
+  for (const el of document.querySelectorAll("[data-layout-short]")) el.textContent = S.layout === "71" ? "7.1" : "Stereo";
+  document.querySelector("[data-radar-cap]").textContent = S.radar.mode === "cross" ? "Window 180 × 180 px, around the crosshair" : "Window 200 × 200 px, lower centre";
+  drawLegend();
+}
+document.addEventListener("click", (e) => {
+  const t = e.target.closest("button"); if (!t) return;
+  const tw = t.closest("[data-tweak]"); if (tw && t.dataset.v) { S[tw.dataset.tweak] = t.dataset.v; if (tw.dataset.tweak === "scenario") levels.clear(); syncControls(); }
+  const seg = t.closest("[data-bind-seg]"); if (seg && t.dataset.v) { set(seg.dataset.bindSeg, t.dataset.v); syncControls(); }
+  if (t.dataset.bindSwitch) { set(t.dataset.bindSwitch, !get(t.dataset.bindSwitch)); syncControls(); }
+  if ("testLr" in t.dataset) { testT = 0; S.paused = false; syncControls(); }
+  if ("sheet" in t.dataset) {
+    const open = t.getAttribute("aria-expanded") !== "true";
+    for (const p of t.parentElement.querySelectorAll("[data-sheet]")) { p.setAttribute("aria-expanded", "false"); document.getElementById(p.getAttribute("aria-controls")).hidden = true; }
+    t.setAttribute("aria-expanded", String(open)); document.getElementById(t.getAttribute("aria-controls")).hidden = !open;
+  }
+});
+document.addEventListener("input", (e) => {
+  const i = e.target;
+  if (i.dataset.bind) { set(i.dataset.bind, Number(i.value)); syncControls(); }
+  if (i.dataset.bindCheck) { set(i.dataset.bindCheck, i.checked); syncControls(); }
+  if (i.dataset.tweakCheck) { S[i.dataset.tweakCheck] = i.checked; syncControls(); }
+});
+// Orbit tabs: click + arrow keys (WAI-ARIA tabs pattern)
+const tabs = [...document.querySelectorAll('.p-orbit [role=tab]')];
+function selectTab(tab) {
+  for (const t of tabs) { const on = t === tab; t.setAttribute("aria-selected", String(on)); t.tabIndex = on ? 0 : -1; document.getElementById(t.getAttribute("aria-controls")).hidden = !on; }
+  tab.focus();
+}
+for (const t of tabs) {
+  t.addEventListener("click", () => selectTab(t));
+  t.addEventListener("keydown", (e) => {
+    const i = tabs.indexOf(t), n = e.key === "ArrowRight" ? 1 : e.key === "ArrowLeft" ? -1 : 0;
+    if (n) { e.preventDefault(); selectTab(tabs[(i + n + tabs.length) % tabs.length]); }
+  });
+}
+
+// ---------------------------------------------------------------- loop
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  if (!S.paused) stepSim(dt);
+  for (const st of stages) drawStage(st);
+  requestAnimationFrame(frame);
+}
+for (let i = 0; i < 130; i++) stepSim(1 / 60);   // pre-roll: open on a live scene (a settled still under reduced motion)
+syncControls();
+document.fonts.ready.then(() => { drawLegend(); requestAnimationFrame(frame); });
+</script>
+</body>
+</html>

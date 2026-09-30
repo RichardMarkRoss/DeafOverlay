@@ -52,7 +52,35 @@ enum Cmd {
     SetProcess(u32),
     SwapLr(bool),
     BandGains([f32; 6]),
+    FrontBack(bool),
     Stop,
+}
+
+/// User DSP settings, kept across stream reopens (device change, Alt+G).
+#[derive(Clone, Copy)]
+struct DspSettings {
+    swap_lr: bool,
+    gains: [f32; 6],
+    front_back: bool,
+}
+
+impl DspSettings {
+    /// Take a settings command; false if `cmd` is something else.
+    fn update(&mut self, cmd: &Cmd) -> bool {
+        match *cmd {
+            Cmd::SwapLr(on) => self.swap_lr = on,
+            Cmd::BandGains(g) => self.gains = g,
+            Cmd::FrontBack(on) => self.front_back = on,
+            _ => return false,
+        }
+        true
+    }
+
+    fn apply(&self, a: &mut Analyzer) {
+        a.swap_lr = self.swap_lr;
+        a.set_band_gains(self.gains);
+        a.front_back = self.front_back;
+    }
 }
 
 enum Exit {
@@ -97,6 +125,11 @@ impl Capture {
         let _ = self.tx.send(Cmd::SwapLr(on));
     }
 
+    /// Stereo only: guess front/back for HRTF ("headphone 3D") games. See [`dsp::frontback`].
+    pub fn set_front_back(&self, on: bool) {
+        let _ = self.tx.send(Cmd::FrontBack(on));
+    }
+
     /// See [`dsp::Analyzer::set_band_gains`].
     pub fn set_band_gains(&self, gains: [f32; 6]) {
         let _ = self.tx.send(Cmd::BandGains(gains));
@@ -132,8 +165,7 @@ struct Stream {
 fn worker(rx: Receiver<Cmd>, shared: Arc<Mutex<Shared>>) {
     let _ = wasapi::initialize_mta().ok();
     let mut pid = 0u32;
-    let mut swap = false;
-    let mut gains = [1.0f32; 6];
+    let mut dsp = DspSettings { swap_lr: false, gains: [1.0; 6], front_back: false };
     loop {
         let opened = open(pid);
         let stream = match opened {
@@ -155,16 +187,16 @@ fn worker(rx: Receiver<Cmd>, shared: Arc<Mutex<Shared>>) {
                 match rx.recv_timeout(RETRY) {
                     Ok(Cmd::Stop) | Err(RecvTimeoutError::Disconnected) => return,
                     Ok(Cmd::SetProcess(p)) => pid = p,
-                    Ok(Cmd::SwapLr(on)) => swap = on,
-                    Ok(Cmd::BandGains(g)) => gains = g,
+                    Ok(cmd) => {
+                        dsp.update(&cmd);
+                    }
                     Err(RecvTimeoutError::Timeout) => {}
                 }
                 continue;
             }
         };
         let mut analyzer = Analyzer::new(&stream.azimuths, stream.sample_rate as f32);
-        analyzer.swap_lr = swap;
-        analyzer.set_band_gains(gains);
+        dsp.apply(&mut analyzer);
         {
             let mut sh = lock(&shared);
             sh.status = Status {
@@ -178,7 +210,7 @@ fn worker(rx: Receiver<Cmd>, shared: Arc<Mutex<Shared>>) {
                 error: None,
             };
         }
-        match run(&stream, &mut analyzer, &rx, &shared, &mut pid, &mut swap, &mut gains) {
+        match run(&stream, &mut analyzer, &rx, &shared, &mut pid, &mut dsp) {
             Ok(Exit::Stop) => return,
             Ok(Exit::Reopen) => {}
             Err(e) => {
@@ -198,8 +230,7 @@ fn run(
     rx: &Receiver<Cmd>,
     shared: &Mutex<Shared>,
     pid: &mut u32,
-    swap: &mut bool,
-    gains: &mut [f32; 6],
+    dsp: &mut DspSettings,
 ) -> Res<Exit> {
     let mut bytes = Vec::new();
     let mut samples = Vec::new();
@@ -213,15 +244,12 @@ fn run(
                     return Ok(Exit::Reopen);
                 }
                 Ok(Cmd::SetProcess(_)) => {}
-                Ok(Cmd::SwapLr(on)) => {
-                    *swap = on;
-                    analyzer.swap_lr = on;
-                }
-                Ok(Cmd::BandGains(g)) => {
-                    *gains = g;
-                    analyzer.set_band_gains(g);
-                }
                 Ok(Cmd::Stop) | Err(TryRecvError::Disconnected) => return Ok(Exit::Stop),
+                Ok(cmd) => {
+                    if dsp.update(&cmd) {
+                        dsp.apply(analyzer);
+                    }
+                }
                 Err(TryRecvError::Empty) => break,
             }
         }

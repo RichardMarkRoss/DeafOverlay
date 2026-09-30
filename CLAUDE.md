@@ -38,6 +38,11 @@ The C++ app has **no tests and no linter**. The only quality gate is the compile
 
 A Cargo workspace that replaces the C++ app, with feature parity plus the new direction DSP.
 - `crates/dsp`: the platform-free direction pipeline (STFT → per-bin votes → azimuth histogram → tracker). It also holds `baseline.rs`, a port of the v1 C++ direction maths that the new pipeline is scored against.
+  - `frontback.rs` is the experimental stereo front/back guess for HRTF ("headphone 3D") games.
+    - A logistic regression over per-band interaural level differences and spectral shape. The analyzer credits each voting bin's L/R power to its nearest peak, and the tracker accumulates it per track.
+    - Off by default (`Analyzer::front_back`). A track is mirrored behind only when its smoothed P(behind) is ≥ 0.8 after enough evidence.
+    - `SHIPPED` holds the trained weights. Regenerate them with `cargo run --release -p dsp --example frontback -- <dir of .hrir>`: download SOFA files from sofacoustics.org, then convert them with `rust/tools/sofa_to_hrir.py`. Only the weights are committed, never the HRIR data.
+    - The test `front_back_guess_never_puts_front_sounds_behind` guards the failure that matters most: a wrong "behind".
 - `crates/capture`: WASAPI loopback (the `wasapi` crate) feeding `dsp::Analyzer`.
   - One background thread does both capture and analysis. The UI polls `Capture::sources()` / `status()` through a mutex; commands arrive over a channel.
   - The stream opens in the default device's native layout. `layout.rs` maps the channel mask to azimuths, and 5.1 surround pairs map to ±110°.
@@ -47,10 +52,17 @@ A Cargo workspace that replaces the C++ app, with feature parity plus the new di
   - `tone.rs` is the L/R self-test: a 600 Hz tone on a second (render) WASAPI stream. It beeps rather than holding a steady tone, because the DSP votes on onsets and tunes out steady sounds within about 0.5 s.
   - `set_band_gains` carries v1's six band sliders and presets into the DSP as per-bin vote weights, using the same band edges.
 - `crates/app` (binary `deafoverlay`) is the overlay:
-  - `hud.rs` is platform-free. It ports `draw_sphere` / `draw_ring` / `dir_color` into premultiplied `0xAARRGGBB` pixels, so it's unit-tested without a window.
-  - `Normalizer` maps the tracker's unbounded `strength` to v1's 0–1 `amp` with a slow auto-gain. `REF_MIN` is its calibration knob.
+  - `gfx.rs` is antialiased software drawing: signed-distance shapes (circles, ellipse arcs, polygons, wedges, rounded rects) alpha-blended into premultiplied `0xAARRGGBB` pixels. Every shape supports fill, hatch or dashed stroke.
+  - `hud.rs` holds three user-selectable HUD styles (`HudStyle`), designed in `design/HUD Concepts.html`: Orbit, Radar (plus a crosshair mode) and Compass tape.
+    - Each style has its own window size (`hud::size`).
+    - Three palettes (`PaletteKind`), including colour-blind and high-contrast.
+    - Shared encoding: loudness = size and opacity. Behind = hollow or hatched plus "BEHIND". The stereo front/back guess = dashed plus "BEHIND?". Never colour alone.
+    - `Normalizer` maps tracker strength to 0–1 and derives rear status from the layout. `REF_MIN` is its calibration knob.
+  - HUD labels come back as `Label`s. `main.rs`'s `LabelRenderer` draws them antialiased and outlined, using GDI text in a scratch DIB as a coverage mask.
   - `ui.rs` is the settings panel (Controls and Setup views). A single `panel()` builder does both the drawing (given a canvas) and the list of clickable widgets, so drawing and hit-testing can't drift apart like v1's did. Add controls there only.
-  - `main.rs` is the Win32 shell. It follows the same rules as v1: the window size comes from the DIB (settings mode grows it to `WIN_H_SETTINGS`), GDI text is forced opaque, `HTTRANSPARENT` makes it click-through, and Alt+H/I/G/Q are the hotkeys.
+  - `main.rs` is the Win32 shell. It follows the same rules as v1: the window size comes from the DIB, `HTTRANSPARENT` makes it click-through, and Alt+H/I/G/Q are the hotkeys.
+    - `App::geometry` sizes the window to the chosen style. In settings mode it becomes the wider of the HUD and the panel, with the panel below.
+    - `win` is the HUD's own top-left on screen. Style and size changes keep the HUD centred (`change_hud`), and crosshair mode snaps to the screen centre.
   - `persist.rs` handles settings persistence. It uses v1's file, keys and layout (`%APPDATA%\DeafOverlay\settings.json`), so both builds share one settings file. It reads with `serde_json` (clamped, and missing keys keep their defaults) and writes via a temp file plus rename. Saves happen after each change, window move, settings close and quit. The first-run flag is v1's `HKCU\Software\DeafOverlay\OnboardingDone`, and on first run the app opens the Setup view.
   - `rust/.cargo/config.toml` links the C runtime statically, so `target/release/deafoverlay.exe` is one standalone file with no VC++ Redistributable needed.
   - `wnd_proc` only queues mouse events; the main loop handles them. Info popups and the window-move loop are modal and re-enter `wnd_proc`, so handling input there would mean re-entrant access to the app state.

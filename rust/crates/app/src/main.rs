@@ -14,10 +14,12 @@
 #![windows_subsystem = "windows"]
 
 use capture::{Capture, Tone};
-use deafoverlay::hud::{self, Canvas, Normalizer, HUD_AREA_H, HUD_W};
+use deafoverlay::gfx::{Canvas, BLACK};
+use deafoverlay::hud::{self, Label, Normalizer, Scene};
 use deafoverlay::persist;
-use deafoverlay::ui::{self, Action, Settings, SetupInfo, View, WIN_H_SETTINGS};
+use deafoverlay::ui::{self, Action, Settings, SetupInfo, View, PANEL_BOTTOM, PANEL_GAP, PANEL_H, PANEL_W};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use windows::core::{w, HSTRING, PCWSTR};
@@ -34,7 +36,6 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-const WIN_H_NORMAL: usize = HUD_AREA_H;
 const HK_TOGGLE_VIS: i32 = 1;
 const HK_TOGGLE_CFG: i32 = 2;
 const HK_QUIT: i32 = 3;
@@ -49,7 +50,7 @@ static SETTINGS_OPEN: AtomicBool = AtomicBool::new(false);
 #[derive(Clone, Copy)]
 enum Ev {
     Down(i32, i32),
-    Move(i32, i32),
+    Move(i32), // x only: sliders are horizontal
     Up,
 }
 
@@ -97,7 +98,7 @@ impl Dib {
     fn canvas(&mut self) -> Canvas<'_> {
         // SAFETY: CreateDIBSection allocated w*h 32-bit pixels; `&mut self` keeps this the only view.
         let px = unsafe { std::slice::from_raw_parts_mut(self.bits, self.w * self.h) };
-        Canvas { w: self.w, h: self.h, px }
+        Canvas::new(self.w, self.h, px)
     }
 
     /// v1 `text_out_opaque`: GDI text, then force the glyph box opaque (GDI leaves alpha at 0).
@@ -145,6 +146,88 @@ impl Drop for Dib {
     }
 }
 
+/// HUD labels, drawn properly over a transparent window: GDI renders white-on-black text into a
+/// scratch DIB (grayscale antialiasing), and that brightness becomes the coverage for an outlined,
+/// alpha-blended label. (Plain GDI text can't be alpha-blended, which is why the panel instead
+/// forces an opaque box behind its text.)
+struct LabelRenderer {
+    scratch: Dib,
+    fonts: HashMap<(i32, bool), HFONT>,
+}
+
+impl LabelRenderer {
+    fn new() -> windows::core::Result<Self> {
+        Ok(Self { scratch: Dib::new(320, 48)?, fonts: HashMap::new() })
+    }
+
+    fn font(&mut self, px: i32, mono: bool) -> HFONT {
+        *self.fonts.entry((px, mono)).or_insert_with(|| unsafe {
+            let face = if mono { w!("Consolas") } else { w!("Segoe UI Semibold") };
+            let weight = if mono { FW_NORMAL } else { FW_SEMIBOLD }; // Consolas has no real semibold
+            CreateFontW(-px, 0, 0, 0, weight.0 as i32, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, 0, face)
+        })
+    }
+
+    fn draw(&mut self, c: &mut Canvas, labels: &[Label]) {
+        for l in labels {
+            let font = self.font(l.px, l.mono);
+            let wide: Vec<u16> = l.text.encode_utf16().collect();
+            let d = &mut self.scratch;
+            let mut sz = SIZE::default();
+            unsafe {
+                SelectObject(d.dc, font.into());
+                let _ = GetTextExtentPoint32W(d.dc, &wide, &mut sz);
+            }
+            let (w, h) = ((sz.cx as usize + 2).min(d.w), (sz.cy as usize + 2).min(d.h));
+            {
+                let mask = d.canvas();
+                for y in 0..h {
+                    mask.px[y * mask.w..y * mask.w + w].fill(0);
+                }
+            }
+            unsafe {
+                SetTextColor(d.dc, COLORREF(0x00FF_FFFF));
+                let _ = TextOutW(d.dc, 1, 1, &wide);
+                let _ = GdiFlush();
+            }
+            let mask = d.canvas();
+            let cov = |x: i32, y: i32| -> f32 {
+                if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
+                    0.0
+                } else {
+                    ((mask.px[y as usize * mask.w + x as usize] >> 16) & 0xFF) as f32 / 255.0
+                }
+            };
+            let (x0, y0) = ((l.x - w as f32 / 2.0).round() as i32, (l.y - h as f32 / 2.0).round() as i32);
+            // dark outline first (coverage grown by a pixel, plus-shaped so small text stays crisp)
+            for y in -1..=h as i32 {
+                for x in -1..=w as i32 {
+                    let mut o = 0.0f32;
+                    for (dx, dy) in [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)] {
+                        o = o.max(cov(x + dx, y + dy));
+                    }
+                    c.blend(x0 + x, y0 + y, BLACK, 0.8 * o);
+                }
+            }
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    c.blend(x0 + x, y0 + y, l.rgb, cov(x, y));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for LabelRenderer {
+    fn drop(&mut self) {
+        for f in self.fonts.values() {
+            unsafe {
+                let _ = DeleteObject((*f).into());
+            }
+        }
+    }
+}
+
 /// Push the DIB to the layered window. No destination point: keep the window where it is and take
 /// the size from the DIB, so resizing the window means resizing the DIB (v1 `blit_layered`).
 fn blit(hwnd: HWND, dib: &Dib) {
@@ -164,12 +247,12 @@ fn blit(hwnd: HWND, dib: &Dib) {
 enum Drag {
     None,
     Slider { i: usize, x0: i32, x1: i32 },
-    Sphere,
 }
 
 struct App {
     hwnd: HWND,
     dib: Dib,
+    labels: LabelRenderer,
     capture: Capture,
     tone: Option<Tone>,
     norm: Normalizer,
@@ -178,7 +261,7 @@ struct App {
     open: bool,
     visible: bool,
     drag: Drag,
-    /// HUD top-left on screen; the settings window may be nudged up to fit, then restored.
+    /// HUD top-left on screen. The settings window may sit wider (panel) or be nudged up to fit.
     win: (i32, i32),
     /// (pid, exe name) for the Setup view's "Capturing:" line.
     proc_name: (u32, String),
@@ -194,10 +277,6 @@ impl App {
             self.drag = Drag::None;
             self.tone = None; // stops the self-test
         }
-        let h = if on { WIN_H_SETTINGS } else { WIN_H_NORMAL };
-        if let Ok(d) = Dib::new(HUD_W, h) {
-            self.dib = d;
-        }
         unsafe {
             let mut ex = GetWindowLongW(self.hwnd, GWL_EXSTYLE);
             if on {
@@ -207,20 +286,61 @@ impl App {
                 let _ = ReleaseCapture();
             }
             SetWindowLongW(self.hwnd, GWL_EXSTYLE, ex);
+        }
+        self.apply_geometry();
+    }
+
+    fn hud_size(&self) -> (i32, i32) {
+        let (w, h) = hud::size(&self.settings.hud);
+        (w as i32, h as i32)
+    }
+
+    /// Window size, and the HUD's x offset inside it. Normal mode is exactly the HUD; settings
+    /// mode adds the panel below and is as wide as the wider of the two, HUD centred on top.
+    fn geometry(&self) -> (i32, i32, i32) {
+        let (hw, hh) = self.hud_size();
+        if !self.open {
+            return (hw, hh, 0);
+        }
+        let w = hw.max(PANEL_W + 20);
+        (w, hh + PANEL_GAP + PANEL_H + PANEL_BOTTOM, (w - hw) / 2)
+    }
+
+    fn panel_origin(&self) -> (i32, i32) {
+        let (w, _, _) = self.geometry();
+        ((w - PANEL_W) / 2, self.hud_size().1 + PANEL_GAP)
+    }
+
+    /// Size the DIB (which sizes the window) and place the window so the HUD stays at `win`.
+    fn apply_geometry(&mut self) {
+        let (w, h, off) = self.geometry();
+        if (self.dib.w, self.dib.h) != (w as usize, h as usize) {
+            if let Ok(d) = Dib::new(w as usize, h as usize) {
+                self.dib = d;
+            }
+        }
+        unsafe {
             // Keep the taller settings window on-screen; the HUD position itself is preserved.
             let screen_h = GetSystemMetrics(SM_CYSCREEN);
-            let mut top = self.win.1;
-            if on && top + WIN_H_SETTINGS as i32 > screen_h {
-                top = (screen_h - WIN_H_SETTINGS as i32).max(0);
-            }
+            let top = if self.open && self.win.1 + h > screen_h { (screen_h - h).max(0) } else { self.win.1 };
             let flags = SWP_NOSIZE | SWP_FRAMECHANGED | SWP_NOACTIVATE;
-            let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), self.win.0, top, 0, 0, flags);
+            let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), self.win.0 - off, top, 0, 0, flags);
         }
+    }
+
+    /// Change what the HUD looks like, keeping its centre where it is on screen.
+    fn change_hud(&mut self, f: impl FnOnce(&mut Settings)) {
+        let (w0, h0) = self.hud_size();
+        f(&mut self.settings);
+        let (w1, h1) = self.hud_size();
+        self.win = (self.win.0 + (w0 - w1) / 2, self.win.1 + (h0 - h1) / 2);
+        self.apply_geometry();
     }
 
     fn push_dsp_settings(&self) {
         self.capture.set_swap_lr(self.settings.swap_lr);
         self.capture.set_band_gains(self.settings.band_gain);
+        self.capture.set_front_back(self.settings.front_back);
     }
 
     fn setup_info(&mut self) -> SetupInfo {
@@ -243,20 +363,18 @@ impl App {
         }
         match ev {
             Ev::Down(x, y) => self.mouse_down(x, y),
-            Ev::Move(x, y) => match self.drag {
+            Ev::Move(x) => match self.drag {
                 Drag::Slider { i, x0, x1 } => {
-                    self.settings.set_slider(i, (x - x0) as f32 / (x1 - x0) as f32);
+                    let t = (x - x0) as f32 / (x1 - x0) as f32;
+                    // Size (slider 0) resizes the window, so go through change_hud to stay centred.
+                    self.change_hud(|s| s.set_slider(i, t));
                     self.settings_changed();
-                }
-                Drag::Sphere => {
-                    self.settings.layout.sphere_x = (x as f32 / HUD_W as f32).clamp(0.05, 0.95);
-                    self.settings.layout.sphere_y = (y as f32 / HUD_AREA_H as f32).clamp(0.05, 0.95);
                 }
                 Drag::None => {}
             },
             Ev::Up => {
                 if !matches!(self.drag, Drag::None) {
-                    self.save(); // v1 saved after every slider/sphere drag
+                    self.save(); // v1 saved after every slider drag
                 }
                 self.drag = Drag::None;
                 unsafe {
@@ -277,7 +395,7 @@ impl App {
 
     fn mouse_down(&mut self, x: i32, y: i32) {
         let info = self.setup_info();
-        let panel = ui::panel(None, self.view, &self.settings, &info);
+        let panel = ui::panel(None, self.panel_origin(), self.view, &self.settings, &info);
         if let Some(action) = panel.hit(x, y) {
             match action {
                 Action::Info(text) => unsafe {
@@ -287,10 +405,34 @@ impl App {
                     let (x0, x1) = panel.slider_span(i).unwrap_or((0, 1));
                     self.drag = Drag::Slider { i, x0, x1 };
                     unsafe { SetCapture(self.hwnd) };
-                    self.handle(Ev::Move(x, y));
+                    self.handle(Ev::Move(x));
+                }
+                Action::Style(style) => {
+                    self.change_hud(|s| s.hud.style = style);
+                    self.save();
+                }
+                Action::Crosshair => {
+                    self.change_hud(|s| s.hud.crosshair = !s.hud.crosshair);
+                    if self.settings.hud.crosshair {
+                        // The point of crosshair mode: centre the arcs on the aim point.
+                        let (hw, hh) = self.hud_size();
+                        let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+                        self.win = ((sw - hw) / 2, (sh - hh) / 2);
+                        self.apply_geometry();
+                    }
+                    self.save();
+                }
+                Action::Palette(p) => {
+                    self.settings.hud.palette = p;
+                    self.save();
                 }
                 Action::SwapLr => {
                     self.settings.swap_lr = !self.settings.swap_lr;
+                    self.settings_changed();
+                    self.save();
+                }
+                Action::FrontBack => {
+                    self.settings.front_back = !self.settings.front_back;
                     self.settings_changed();
                     self.save();
                 }
@@ -311,15 +453,6 @@ impl App {
             return;
         }
 
-        // The sphere: drag to fine-position it within the HUD area.
-        let (cx, cy, r) = self.settings.layout.sphere();
-        let (dx, dy) = (x as f32 - cx, y as f32 - cy);
-        if y < HUD_AREA_H as i32 && dx * dx + dy * dy <= r * r * 1.3 {
-            self.drag = Drag::Sphere;
-            unsafe { SetCapture(self.hwnd) };
-            return;
-        }
-
         // Anywhere else: move the whole window through the system move loop, so the layered
         // window follows the cursor cleanly. It returns when the button is released.
         unsafe {
@@ -327,7 +460,7 @@ impl App {
             SendMessageW(self.hwnd, WM_NCLBUTTONDOWN, Some(WPARAM(HTCAPTION as usize)), Some(LPARAM(0)));
             let mut rc = RECT::default();
             if GetWindowRect(self.hwnd, &mut rc).is_ok() {
-                self.win = (rc.left, rc.top);
+                self.win = (rc.left + self.geometry().2, rc.top);
             }
             self.save();
         }
@@ -339,22 +472,26 @@ impl App {
         }
         let st = self.capture.status();
         let peaks = self.norm.peaks(&self.capture.sources(), st.full_360, self.settings.sensitivity, dt);
-        let lay = self.settings.layout;
-        hud::draw(&mut self.dib.canvas(), &lay, &peaks, self.open);
-
-        // "FRONT" above the ring's top so forward is always clear (top = front, bottom = behind).
-        let (rcx, rcy, _, rb) = lay.ring();
-        let sz = self.dib.measure("FRONT");
-        self.dib.text(rcx.round() as i32 - sz.cx / 2, (rcy - rb).round() as i32 - sz.cy - 3, "FRONT", (150, 235, 170));
+        let scene = Scene { full_360: st.full_360, front_back: self.settings.front_back };
+        let (_, _, off) = self.geometry();
+        let hud = self.settings.hud;
+        let labels = {
+            let mut c = self.dib.canvas();
+            if self.open {
+                c.fill(150, 0, 0, 0); // light dim so every pixel takes clicks
+            } else {
+                c.px.fill(0); // transparent, and click-through
+            }
+            hud::draw(&mut c, (off as f32, 0.0), &hud, &peaks, scene)
+        };
+        let mut c = self.dib.canvas();
+        c.alpha = hud.opacity;
+        self.labels.draw(&mut c, &labels);
 
         if self.open {
-            let (tx, ty) = hud::draw_hint_box(&mut self.dib.canvas());
-            self.dib.text(tx, ty, "DeafOverlay Hotkeys", (255, 255, 255));
-            self.dib.text(tx, ty + 20, "Alt+H: Show/Hide   Alt+I: Settings   Alt+Q: Quit", (255, 255, 255));
-            self.dib.text(tx, ty + 38, "Best accuracy: 7.1 or Stereo, Spatial OFF", (255, 255, 255));
-
             let info = self.setup_info();
-            let panel = ui::panel(Some(&mut self.dib.canvas()), self.view, &self.settings, &info);
+            let origin = self.panel_origin();
+            let panel = ui::panel(Some(&mut self.dib.canvas()), origin, self.view, &self.settings, &info);
             self.dib.draw_texts(&panel.texts);
         }
         blit(self.hwnd, &self.dib);
@@ -402,7 +539,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 LRESULT(0)
             }
             WM_MOUSEMOVE if settings && (wparam.0 & 0x0001) != 0 => { // MK_LBUTTON
-                push(Ev::Move(x, y));
+                push(Ev::Move(x));
                 LRESULT(0)
             }
             WM_LBUTTONUP if settings => {
@@ -432,12 +569,14 @@ fn main() -> windows::core::Result<()> {
             ..Default::default()
         });
 
-        // Saved position, else upper-right like v1. Clamp so a stale position (resolution change,
-        // unplugged monitor) can't strand the window off-screen.
+        // Saved position, else just below the crosshair (research: keep cues near the centre).
+        // Clamp so a stale position (resolution change, unplugged monitor) can't strand it off-screen.
         let (settings, saved_win) = persist::load();
         let (screen_w, screen_h) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
-        let (wx, wy) = saved_win.unwrap_or((screen_w - HUD_W as i32 - 40, 80));
-        let win = (wx.clamp(0, (screen_w - HUD_W as i32).max(0)), wy.clamp(0, (screen_h - WIN_H_NORMAL as i32).max(0)));
+        let (hw, hh) = hud::size(&settings.hud);
+        let (hw, hh) = (hw as i32, hh as i32);
+        let (wx, wy) = saved_win.unwrap_or(((screen_w - hw) / 2, screen_h * 62 / 100 - hh / 2));
+        let win = (wx.clamp(0, (screen_w - hw).max(0)), wy.clamp(0, (screen_h - hh).max(0)));
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT,
             class,
@@ -445,8 +584,8 @@ fn main() -> windows::core::Result<()> {
             WS_POPUP,
             win.0,
             win.1,
-            HUD_W as i32,
-            WIN_H_NORMAL as i32,
+            hw,
+            hh,
             None,
             None,
             Some(instance),
@@ -462,7 +601,8 @@ fn main() -> windows::core::Result<()> {
 
         let mut app = App {
             hwnd,
-            dib: Dib::new(HUD_W, WIN_H_NORMAL)?,
+            dib: Dib::new(hw as usize, hh as usize)?,
+            labels: LabelRenderer::new()?,
             capture: Capture::start(),
             tone: None,
             norm: Normalizer::default(),
