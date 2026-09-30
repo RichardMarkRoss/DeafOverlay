@@ -32,13 +32,44 @@ Both `cl.exe` and `ninja.exe` ship with Visual Studio (ninja under `Common7\IDE\
 
 The repo is also a Visual Studio "Open Folder" CMake project — VS picks up `CMakePresets.json` directly (and provides the developer environment automatically).
 
-There are **no tests and no linter**. The only quality gate is the compiler: MSVC is configured with `/W4 /permissive- /Zc:preprocessor`, so keep the build warning-clean.
+The C++ app has **no tests and no linter**. The only quality gate is the compiler: MSVC is configured with `/W4 /permissive- /Zc:preprocessor`, so keep the build warning-clean.
+
+## Rust rewrite (in progress, `rust/`)
+
+A Cargo workspace that replaces the C++ app, with feature parity plus the new direction DSP.
+- `crates/dsp`: the platform-free direction pipeline (STFT → per-bin votes → azimuth histogram → tracker). It also holds `baseline.rs`, a port of the v1 C++ direction maths that the new pipeline is scored against.
+- `crates/capture`: WASAPI loopback (the `wasapi` crate) feeding `dsp::Analyzer`.
+  - One background thread does both capture and analysis. The UI polls `Capture::sources()` / `status()` through a mutex; commands arrive over a channel.
+  - The stream opens in the default device's native layout. `layout.rs` maps the channel mask to azimuths, and 5.1 surround pairs map to ±110°.
+  - The stream reopens itself when the default device changes or is invalidated.
+  - `set_process(pid)` is the Alt+G path. It falls back to the system mix and sets `proc_unsupported`, like v1.
+  - While nothing plays, loopback delivers no packets, so the thread feeds silence on each 100 ms wait timeout to keep sources fading.
+  - `tone.rs` is the L/R self-test: a 600 Hz tone on a second (render) WASAPI stream. It beeps rather than holding a steady tone, because the DSP votes on onsets and tunes out steady sounds within about 0.5 s.
+  - `set_band_gains` carries v1's six band sliders and presets into the DSP as per-bin vote weights, using the same band edges.
+- `crates/app` (binary `deafoverlay`) is the overlay:
+  - `hud.rs` is platform-free. It ports `draw_sphere` / `draw_ring` / `dir_color` into premultiplied `0xAARRGGBB` pixels, so it's unit-tested without a window.
+  - `Normalizer` maps the tracker's unbounded `strength` to v1's 0–1 `amp` with a slow auto-gain. `REF_MIN` is its calibration knob.
+  - `ui.rs` is the settings panel (Controls and Setup views). A single `panel()` builder does both the drawing (given a canvas) and the list of clickable widgets, so drawing and hit-testing can't drift apart like v1's did. Add controls there only.
+  - `main.rs` is the Win32 shell. It follows the same rules as v1: the window size comes from the DIB (settings mode grows it to `WIN_H_SETTINGS`), GDI text is forced opaque, `HTTRANSPARENT` makes it click-through, and Alt+H/I/G/Q are the hotkeys.
+  - `persist.rs` handles settings persistence. It uses v1's file, keys and layout (`%APPDATA%\DeafOverlay\settings.json`), so both builds share one settings file. It reads with `serde_json` (clamped, and missing keys keep their defaults) and writes via a temp file plus rename. Saves happen after each change, window move, settings close and quit. The first-run flag is v1's `HKCU\Software\DeafOverlay\OnboardingDone`, and on first run the app opens the Setup view.
+  - `rust/.cargo/config.toml` links the C runtime statically, so `target/release/deafoverlay.exe` is one standalone file with no VC++ Redistributable needed.
+  - `wnd_proc` only queues mouse events; the main loop handles them. Info popups and the window-move loop are modal and re-enter `wnd_proc`, so handling input there would mean re-entrant access to the app state.
+
+```sh
+cd rust
+cargo test                                           # accuracy thresholds (incl. beating v1 everywhere) + layout
+cargo run --release -p dsp --example eval            # accuracy table: v1 vs new
+cargo run --release -p capture --example monitor     # live console view of detected sources [-- --pid N --secs N]
+cargo run --release -p deafoverlay                   # the overlay itself (Alt+Q quits)
+```
+
+Change DSP tunables (the consts at the top of `crates/dsp/src/lib.rs`) only against the eval table. Add a scenario to `eval.rs` for any new failure case you find, rather than tuning by ear.
 
 ## Architecture
 
-The entire application is **one translation unit**: `DeafOverlay/DeafOverlay.cpp` (~1500 lines). There is no class hierarchy — it's a flat Win32 program built around global state and a single message/render loop in `wWinMain`. When adding behavior, follow the existing pattern of file-scope `static` globals (the `g*`/`k*` naming) rather than introducing new abstractions.
+The entire application is **one translation unit**: `DeafOverlay/DeafOverlay.cpp` (~1800 lines). There is no class hierarchy — it's a flat Win32 program built around global state and a single message/render loop in `wWinMain`. When adding behavior, follow the existing pattern of file-scope `static` globals (the `g*`/`k*` naming) rather than introducing new abstractions.
 
-**Vendored dependency:** miniaudio is the only third-party code, included as `third_party/miniaudio.h` with `#define MINIAUDIO_IMPLEMENTATION`. Never edit it. Note that `DeafOverlay/DeafOverlay.h` is an **unused duplicate copy** of miniaudio — the `.cpp` includes `third_party/miniaudio.h`, not the sibling header. Don't add code to `DeafOverlay.h` expecting it to compile in.
+**Vendored dependency:** miniaudio is the only third-party code, included as `DeafOverlay/third_party/miniaudio.h` with `#define MINIAUDIO_IMPLEMENTATION`. Never edit it. Note that `DeafOverlay/DeafOverlay.h` is an **unused duplicate copy** of miniaudio — the `.cpp` includes `third_party/miniaudio.h`, not the sibling header. Don't add code to `DeafOverlay.h` expecting it to compile in.
 
 ### Two threads, shared via atomics
 

@@ -1,0 +1,9 @@
+[package]
+name = "capture"
+version = "0.1.0"
+edition = "2021"
+description = "DeafOverlay WASAPI loopback capture feeding the dsp Analyzer (Windows only)"
+
+[dependencies]
+dsp = { path = "../dsp" }
+wasapi = "0.24"
