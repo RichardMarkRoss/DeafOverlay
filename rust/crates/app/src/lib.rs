@@ -2,4 +2,5 @@
 pub mod gfx;
 pub mod hud;
 pub mod persist;
+pub mod text;
 pub mod ui;

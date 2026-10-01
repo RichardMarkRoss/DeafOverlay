@@ -58,14 +58,37 @@ A Cargo workspace that replaces the C++ app, with feature parity plus the new di
     - Three palettes (`PaletteKind`), including colour-blind and high-contrast.
     - Shared encoding: loudness = size and opacity. Behind = hollow or hatched plus "BEHIND". The stereo front/back guess = dashed plus "BEHIND?". Never colour alone.
     - `Normalizer` maps tracker strength to 0–1 and derives rear status from the layout. `REF_MIN` is its calibration knob.
-  - HUD labels come back as `Label`s. `main.rs`'s `LabelRenderer` draws them antialiased and outlined, using GDI text in a scratch DIB as a coverage mask.
-  - `ui.rs` is the settings panel (Controls and Setup views). A single `panel()` builder does both the drawing (given a canvas) and the list of clickable widgets, so drawing and hit-testing can't drift apart like v1's did. Add controls there only.
+  - All text (HUD labels and the panel) is `text::Text`: a font role, anchor, letter-spacing, uppercase flag and an optional outline. `main.rs`'s `TextRenderer` draws it antialiased (GDI text in a scratch DIB, used as a coverage mask), so text blends over the translucent window. Nothing forces opaque boxes any more.
+  - Fonts: Geist and Geist Mono are embedded (`crates/app/fonts/`, SIL OFL 1.1, licence in `OFL.txt`).
+    - `register_fonts()` loads them privately for the process with `AddFontMemResourceEx`; nothing is installed.
+    - Each static weight registers under its own GDI family ("Geist SemiBold", "Geist Mono Medium", …). `face()` maps the `Font` roles to those names.
+    - The test `embedded_geist_faces_resolve` fails if any role falls back to a system font.
+  - `ui.rs` is the settings panel, styled after the website (`heroes-without-sound/app/page.tsx`).
+    - The look: a rounded dark card, the HWS mark, uppercase letter-spaced nav pills, orange-500 primary pills, outlined secondary pills, orange-filled sliders with value readouts, and switch toggles.
+    - Views: Display / Sound / Setup / Support. Info icons open an inline help card, not a message box.
+    - A single `panel()` builder does both the drawing (given a canvas) and the list of clickable widgets, so drawing and hit-testing can't drift apart like v1's did. Add controls there only.
   - `main.rs` is the Win32 shell. It follows the same rules as v1: the window size comes from the DIB, `HTTRANSPARENT` makes it click-through, and Alt+H/I/G/Q are the hotkeys.
-    - `App::geometry` sizes the window to the chosen style. In settings mode it becomes the wider of the HUD and the panel, with the panel below.
-    - `win` is the HUD's own top-left on screen. Style and size changes keep the HUD centred (`change_hud`), and crosshair mode snaps to the screen centre.
+    - The HUD and the settings panel are two separate layered windows, so each can be placed on its own. `wnd_proc` tells them apart via `PANEL_HWND`.
+    - The panel window is shown and hidden with Alt+I and can be dragged by any empty part of the card.
+    - While settings are open the HUD is draggable too (`HUD_INTERACTIVE`: a light fill, since layered windows only take clicks on visible pixels).
+    - `win` is the HUD's own top-left on screen. Style and size changes keep the HUD centred (`change_hud` / `place_hud`). Crosshair mode is always pinned to the screen centre and stays click-through.
+    - Both positions persist (`persist::Positions`: `winX/Y` and `panelX/Y`). The panel first opens beside the HUD.
+  - `store.rs` (bin only) handles optional support through Microsoft Store add-ons (`Windows.Services.Store`): $3 and $10 one-off (Durable) and $2/month (Subscription). Every feature stays free; supporters just get a header badge.
+    - `STORE_IDS` holds the add-ons' Partner Center Store IDs. They're empty until the add-ons exist, and the panel then says so.
+    - Prices shown are the Store's localised `FormattedPrice`. `ui::SUPPORT_FALLBACK` is the label shown until the Store answers.
+    - Store calls run on worker threads and report back over a channel (`poll()` each frame). The purchase dialog is owned by the panel window via `IInitializeWithWindow`, which keeps it above the topmost overlay.
+    - Only a packaged (MSIX) run has a Store identity (`GetCurrentPackageFullName`). The plain exe shows "needs the Microsoft Store version" and the BackaBuddy link.
   - `persist.rs` handles settings persistence. It uses v1's file, keys and layout (`%APPDATA%\DeafOverlay\settings.json`), so both builds share one settings file. It reads with `serde_json` (clamped, and missing keys keep their defaults) and writes via a temp file plus rename. Saves happen after each change, window move, settings close and quit. The first-run flag is v1's `HKCU\Software\DeafOverlay\OnboardingDone`, and on first run the app opens the Setup view.
   - `rust/.cargo/config.toml` links the C runtime statically, so `target/release/deafoverlay.exe` is one standalone file with no VC++ Redistributable needed.
-  - `wnd_proc` only queues mouse events; the main loop handles them. Info popups and the window-move loop are modal and re-enter `wnd_proc`, so handling input there would mean re-entrant access to the app state.
+  - `wnd_proc` only queues mouse events; the main loop handles them. The window-move loop is modal and re-enters `wnd_proc`, so handling input there would mean re-entrant access to the app state.
+
+- `rust/packaging/` is the Microsoft Store (MSIX) packaging:
+  - `AppxManifest.xml` is a full-trust desktop app on Windows 10 2004 and later. Its `{TOKENS}` are filled by the build script. The real `IDENTITY_NAME` / `PUBLISHER` come from Partner Center after reserving the app name.
+  - `Assets/*.png` are the tile and Store logos, rendered from `assets-src/logo.html` (the website's HWS mark).
+  - `build-msix.ps1` builds the release exe, stages it with the assets, the Geist OFL and a generated `ThirdPartyNotices.txt` (licence texts of every crate in the exe), then runs `makeappx pack` to produce `rust/target/msix/*.msix`.
+    - `-Assets` re-renders the logos.
+    - `-Install` test-installs through Developer Mode, with no certificate.
+    - `-CertPfx` signs the package; only needed for sideloading, since the Store signs submissions itself.
 
 ```sh
 cd rust

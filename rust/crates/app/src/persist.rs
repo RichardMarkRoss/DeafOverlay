@@ -14,22 +14,30 @@ pub fn path() -> Option<PathBuf> {
     Some(PathBuf::from(std::env::var_os("APPDATA")?).join("DeafOverlay").join("settings.json"))
 }
 
-/// Settings plus the saved window position (absent on first run).
-pub fn load() -> (Settings, Option<(i32, i32)>) {
+/// Saved screen positions (top-left) of the two windows; `None` until first saved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Positions {
+    /// The HUD (v1's `winX` / `winY`).
+    pub hud: Option<(i32, i32)>,
+    /// The detached settings panel.
+    pub panel: Option<(i32, i32)>,
+}
+
+pub fn load() -> (Settings, Positions) {
     match path().and_then(|p| std::fs::read_to_string(p).ok()) {
         Some(s) => from_json(&s),
-        None => (Settings::default(), None),
+        None => (Settings::default(), Positions::default()),
     }
 }
 
 /// Write via a temp file + rename, so a crash mid-save can't leave a truncated settings file.
-pub fn save(s: &Settings, win: (i32, i32)) -> std::io::Result<()> {
+pub fn save(s: &Settings, pos: Positions) -> std::io::Result<()> {
     let p = path().ok_or(std::io::ErrorKind::NotFound)?;
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = p.with_extension("json.tmp");
-    std::fs::write(&tmp, to_json(s, win))?;
+    std::fs::write(&tmp, to_json(s, pos))?;
     std::fs::rename(tmp, p)
 }
 
@@ -41,13 +49,14 @@ fn index<T: PartialEq>(all: &[T], v: T) -> usize {
     all.iter().position(|x| *x == v).unwrap_or(0)
 }
 
-pub fn to_json(s: &Settings, win: (i32, i32)) -> String {
+pub fn to_json(s: &Settings, pos: Positions) -> String {
     let h = &s.hud;
     let bands: Vec<String> = s.band_gain.iter().map(|g| g.to_string()).collect();
+    let xy = |name: &str, p: Option<(i32, i32)>| p.map(|(x, y)| format!("  \"{name}X\": {x},\n  \"{name}Y\": {y},\n")).unwrap_or_default();
     format!(
         "{{\n  \"sphereScale\": {},\n  \"opacity\": {},\n  \"hudStyle\": {},\n  \"radarCrosshair\": {},\n  \
-         \"palette\": {},\n  \"sensitivity\": {},\n  \"swapLR\": {},\n  \"frontBack\": {},\n  \"winX\": {},\n  \
-         \"winY\": {},\n  \"preset\": {},\n  \"bandGain\": [{}]\n}}\n",
+         \"palette\": {},\n  \"sensitivity\": {},\n  \"swapLR\": {},\n  \"frontBack\": {},\n{}{}  \
+         \"preset\": {},\n  \"bandGain\": [{}]\n}}\n",
         h.scale,
         h.opacity,
         index(&STYLES, h.style),
@@ -56,17 +65,17 @@ pub fn to_json(s: &Settings, win: (i32, i32)) -> String {
         s.sensitivity,
         s.swap_lr as i32,
         s.front_back as i32,
-        win.0,
-        win.1,
+        xy("win", pos.hud),
+        xy("panel", pos.panel),
         index(&PRESETS, s.preset),
         bands.join(", ")
     )
 }
 
-pub fn from_json(text: &str) -> (Settings, Option<(i32, i32)>) {
+pub fn from_json(text: &str) -> (Settings, Positions) {
     let mut s = Settings::default();
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
-        return (s, None);
+        return (s, Positions::default());
     };
     let num = |k: &str| v.get(k).and_then(serde_json::Value::as_f64).map(|x| x as f32);
     let pick = |k: &str, n: usize| num(k).map(|x| x as usize).filter(|i| *i < n);
@@ -102,8 +111,8 @@ pub fn from_json(text: &str) -> (Settings, Option<(i32, i32)>) {
             }
         }
     }
-    let win = num("winX").zip(num("winY")).map(|(x, y)| (x as i32, y as i32));
-    (s, win)
+    let at = |name: &str| num(&format!("{name}X")).zip(num(&format!("{name}Y"))).map(|(x, y)| (x as i32, y as i32));
+    (s, Positions { hud: at("win"), panel: at("panel") })
 }
 
 #[cfg(test)]
@@ -121,7 +130,10 @@ mod tests {
         s.hud.crosshair = true;
         s.hud.scale = 1.25;
         s.hud.opacity = 0.7;
-        assert_eq!(from_json(&to_json(&s, (1325, -12))), (s, Some((1325, -12))));
+        let pos = Positions { hud: Some((1325, -12)), panel: Some((40, 300)) };
+        assert_eq!(from_json(&to_json(&s, pos)), (s, pos));
+        let no_panel = Positions { hud: Some((1, 2)), panel: None };
+        assert_eq!(from_json(&to_json(&s, no_panel)).1, no_panel);
     }
 
     #[test]
@@ -131,7 +143,7 @@ mod tests {
                   \"swapLR\": 1,\n  \"spherePosX\": 0.5,\n  \"spherePosY\": 0.47,\n  \"winX\": 1500,\n  \
                   \"winY\": 80,\n  \"preset\": 1,\n  \"bandGain\": [0.75, 1.05, 1.35, 1.45, 1.2, -4]\n}\n";
         let (s, win) = from_json(v1);
-        assert_eq!(win, Some((1500, 80)));
+        assert_eq!(win, Positions { hud: Some((1500, 80)), panel: None });
         assert_eq!((s.hud.scale, s.sensitivity, s.swap_lr, s.preset), (1.6, 1.2, true, Preset::Cs2));
         assert_eq!(s.band_gain, [0.75, 1.05, 1.35, 1.45, 1.2, 0.0]);
         assert_eq!(s.hud.style, HudStyle::Orbit, "v1 users land on the closest style");
@@ -139,9 +151,9 @@ mod tests {
 
     #[test]
     fn junk_or_partial_files_fall_back_to_defaults() {
-        assert_eq!(from_json("not json {"), (Settings::default(), None));
+        assert_eq!(from_json("not json {"), (Settings::default(), Positions::default()));
         let (s, win) = from_json("{\"sensitivity\": 0.8, \"hudStyle\": 7}");
-        assert_eq!((s.sensitivity, s.hud.style, win), (0.8, HudStyle::Orbit, None));
+        assert_eq!((s.sensitivity, s.hud.style, win), (0.8, HudStyle::Orbit, Positions::default()));
         assert_eq!(s.band_gain, [1.0; 6]);
     }
 }

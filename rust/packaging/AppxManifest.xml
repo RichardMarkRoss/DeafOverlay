@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSIX manifest for the Microsoft Store. build-msix.ps1 fills the {TOKENS}:
+  IDENTITY_NAME / PUBLISHER / PUBLISHER_DISPLAY come from Partner Center (Product identity page)
+  once the app name is reserved; the defaults are for local test installs only.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap rescap">
+
+  <Identity Name="{IDENTITY_NAME}" Publisher="{PUBLISHER}" Version="{VERSION}" ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>Heroes Without Sound</DisplayName>
+    <PublisherDisplayName>{PUBLISHER_DISPLAY}</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <Description>See where in-game sounds come from: a directional HUD for deaf and hard-of-hearing players.</Description>
+  </Properties>
+
+  <Dependencies>
+    <!-- Windows 10 2004+. Per-process capture (Alt+G) needs build 20348+ and falls back to the
+         whole system mix on older builds. -->
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="HeroesWithoutSound" Executable="deafoverlay.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="Heroes Without Sound"
+        Description="Directional sound HUD for deaf and hard-of-hearing players."
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" />
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <!-- A classic Win32 desktop app (layered overlay windows, global hotkeys, WASAPI loopback).
+         Loopback capture reads the speaker mix, not the microphone, so no microphone capability. -->
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>

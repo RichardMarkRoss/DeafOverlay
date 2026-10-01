@@ -8,11 +8,16 @@ description = "DeafOverlay: directional sound HUD for deaf and hard-of-hearing p
 dsp = { path = "../dsp" }
 capture = { path = "../capture" }
 serde_json = "1"
+windows-collections = "0.3" # IIterable for passing lists into WinRT (the version `windows` uses)
 windows = { version = "0.62", features = [
+    "Foundation",
+    "Services_Store",
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
+    "Win32_Storage_Packaging_Appx",
+    "Win32_System_Com",
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",

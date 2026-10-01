@@ -11,6 +11,7 @@
 //! (the window renders text with GDI).
 
 use crate::gfx::{Canvas, Paint, Rgb, BLACK, WHITE};
+use crate::text::{Anchor, Font, Text};
 use dsp::Source;
 use std::f32::consts::PI;
 
@@ -48,8 +49,8 @@ pub struct Palette {
 impl PaletteKind {
     pub fn colors(self) -> Palette {
         match self {
-            // Brand amber / cool blue (the demo's oklch values, in sRGB).
-            PaletteKind::Brand => Palette { front: Rgb(246, 178, 60), rear: Rgb(98, 190, 236), line: Rgb(246, 246, 246), muted: Rgb(170, 170, 170), scrim: 0.55 },
+            // The website's orange-400 (#fb923c) / a cool blue for behind.
+            PaletteKind::Brand => Palette { front: Rgb(251, 146, 60), rear: Rgb(98, 190, 236), line: Rgb(246, 246, 246), muted: Rgb(170, 170, 170), scrim: 0.55 },
             // Okabe-Ito orange / sky blue: distinct under the common colour-vision deficiencies.
             PaletteKind::ColorBlind => Palette { front: Rgb(230, 159, 0), rear: Rgb(86, 180, 233), line: Rgb(246, 246, 246), muted: Rgb(170, 170, 170), scrim: 0.55 },
             PaletteKind::HighContrast => Palette { front: Rgb(255, 230, 0), rear: WHITE, line: WHITE, muted: Rgb(215, 215, 215), scrim: 0.78 },
@@ -114,17 +115,6 @@ pub struct Scene {
     pub front_back: bool,
 }
 
-/// Text for the window layer to draw, centred on (x, y) in canvas pixels, with a dark outline.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Label {
-    pub x: f32,
-    pub y: f32,
-    pub text: &'static str,
-    pub rgb: Rgb,
-    pub px: i32,
-    pub mono: bool,
-}
-
 /// Tracker strengths are level-dependent and unbounded; the HUD wants 0..1. A slow auto-gain
 /// (peak reference that halves every few seconds, floored so silence stays dim) plays the role of
 /// v1's auto gain. sqrt compresses the range so quieter sounds stay visible next to loud ones.
@@ -162,8 +152,9 @@ impl Normalizer {
     }
 }
 
-/// Draw the HUD with its top-left at `origin` in the canvas. Returns the labels to draw on top.
-pub fn draw(c: &mut Canvas, origin: (f32, f32), p: &HudParams, peaks: &[Peak], scene: Scene) -> Vec<Label> {
+/// Draw the HUD with its top-left at `origin` in the canvas. Returns the (outlined) labels to
+/// draw on top.
+pub fn draw(c: &mut Canvas, origin: (f32, f32), p: &HudParams, peaks: &[Peak], scene: Scene) -> Vec<Text> {
     let mut out = Hud { labels: Vec::new(), pal: p.palette.colors(), k: p.scale, scene };
     let before = c.alpha;
     c.alpha = p.opacity;
@@ -178,7 +169,7 @@ pub fn draw(c: &mut Canvas, origin: (f32, f32), p: &HudParams, peaks: &[Peak], s
 }
 
 struct Hud {
-    labels: Vec<Label>,
+    labels: Vec<Text>,
     pal: Palette,
     k: f32,
     scene: Scene,
@@ -187,7 +178,8 @@ struct Hud {
 impl Hud {
     fn label(&mut self, x: f32, y: f32, text: &'static str, rgb: Rgb, px: f32, mono: bool) {
         let px = (px * self.k.max(1.0)).round().max(10.0) as i32; // below 10 px, outlined text smears
-        self.labels.push(Label { x, y, text, rgb, px, mono });
+        let font = if mono { Font::MonoMedium } else { Font::SemiBold };
+        self.labels.push(Text::new(text, x, y, Anchor::Center, font, px, rgb).outlined());
     }
 
     fn color(&self, p: &Peak) -> Rgb {
@@ -284,7 +276,6 @@ impl Hud {
         c.circle(cx, cy, r + 8.0 * k, BLACK, self.pal.scrim, Paint::Fill);
         if self.rear_unknown() {
             c.wedge(cx, cy, 0.0, r, 180.0, 90.0, WHITE, 0.07, Paint::Hatch);
-            self.label(cx, cy + r + 2.0 * k, self.rear_note(), self.pal.muted, 9.0, true);
         }
         let line = self.pal.line;
         for (f, a) in [(0.33, 0.18), (0.66, 0.18), (1.0, 0.55)] {
@@ -295,6 +286,8 @@ impl Hud {
             c.line(cx + s * r0, cy - co * r0, cx + s * r, cy - co * r, 1.0, line, 0.12);
         }
         for (deg, t) in [(0.0f32, "000"), (90.0, "090"), (180.0, "180"), (270.0, "270")] {
+            // Where stereo can't see, the bottom label says so instead of giving a bearing.
+            let t = if deg == 180.0 && self.rear_unknown() { self.rear_note() } else { t };
             let (s, co) = deg.to_radians().sin_cos();
             self.label(cx + s * (r + 14.0 * k), cy - co * (r + 14.0 * k), t, self.pal.muted, 9.0, true);
         }
@@ -427,9 +420,9 @@ mod tests {
         let scene = Scene { full_360: false, front_back: true };
         let mut px = vec![0u32; 240 * 240];
         let labels = draw(&mut Canvas::new(240, 240, &mut px), (0.0, 0.0), &p, &behind(Rear::Real), scene);
-        assert!(labels.iter().any(|l| l.text == "BEHIND"));
+        assert!(labels.iter().any(|l| l.s == "BEHIND"));
         let labels = draw(&mut Canvas::new(240, 240, &mut px), (0.0, 0.0), &p, &behind(Rear::Guess), scene);
-        assert!(labels.iter().any(|l| l.text == "BEHIND?"));
+        assert!(labels.iter().any(|l| l.s == "BEHIND?"));
     }
 
     #[test]

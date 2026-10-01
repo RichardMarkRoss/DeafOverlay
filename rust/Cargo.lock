@@ -24,6 +24,7 @@ dependencies = [
  "dsp",
  "serde_json",
  "windows",
+ "windows-collections",
 ]
 
 [[package]]
