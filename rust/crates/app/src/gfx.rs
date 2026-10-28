@@ -205,14 +205,20 @@ impl Canvas<'_> {
         });
     }
 
-    /// Axis-aligned rectangle with corner radius.
+    /// Axis-aligned rectangle with corner radius. Corners smaller than a full pill end are
+    /// continuous (squircle-like, an L4 superellipse), so the curve eases into the straight edge
+    /// instead of meeting it at a visible joint; the radius is stretched 1.25× so the corner reads
+    /// as round as a circular one of `radius`.
     #[allow(clippy::too_many_arguments)]
     pub fn rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, radius: f32, c: Rgb, a: f32, paint: Paint) {
         let pad = stroke_pad(paint);
         let (cx, cy, hx, hy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5, (x1 - x0) * 0.5, (y1 - y0) * 0.5);
+        let squircle = radius > 0.0 && radius < hx.min(hy) - 0.5;
+        let radius = if squircle { (radius * 1.25).min(hx.min(hy)) } else { radius };
         self.shape((x0 - pad, y0 - pad, x1 + pad, y1 + pad), c, a, paint, |x, y| {
             let (qx, qy) = ((x - cx).abs() - hx + radius, (y - cy).abs() - hy + radius);
-            let outside = qx.max(0.0).hypot(qy.max(0.0));
+            let (ox, oy) = (qx.max(0.0), qy.max(0.0));
+            let outside = if squircle { (ox.powi(4) + oy.powi(4)).sqrt().sqrt() } else { ox.hypot(oy) };
             (outside + qx.max(qy).min(0.0) - radius, x + y)
         });
     }

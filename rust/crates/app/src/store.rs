@@ -9,7 +9,7 @@
 //! Only a packaged (MSIX) install has a Store identity. Running the plain exe, the panel says so and
 //! offers the BackaBuddy link instead.
 
-use deafoverlay::ui::Support;
+use deafoverlay::ui::{Support, STORE_SUPPORT};
 use std::sync::mpsc::{self, Receiver, Sender};
 use windows::core::{Interface, HSTRING};
 use windows_collections::IIterable;
@@ -46,7 +46,9 @@ impl Store {
     pub fn start(owner: HWND) -> Self {
         let (tx, rx) = mpsc::channel();
         let mut s = Self { owner: owner.0 as isize, tx, rx, state: Support::default() };
-        if !packaged() {
+        if !STORE_SUPPORT {
+            s.state.available = Some(false); // switched off: never contact the Store
+        } else if !packaged() {
             s.state.available = Some(false);
             s.state.message = Some("In-app support needs the Microsoft Store version.");
         } else {

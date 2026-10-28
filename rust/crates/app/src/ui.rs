@@ -16,13 +16,38 @@ pub const PANEL_H: i32 = 480;
 const FOOTER_H: i32 = 36;
 
 // The website's Tailwind colours.
+const ORANGE_400: Rgb = Rgb(251, 146, 60); // hover
 const ORANGE_500: Rgb = Rgb(249, 115, 22);
+const ORANGE_600: Rgb = Rgb(234, 88, 12); // pressed
 const ORANGE_300: Rgb = Rgb(253, 186, 116);
 const GRAY_200: Rgb = Rgb(229, 231, 235);
 const GRAY_300: Rgb = Rgb(209, 213, 219);
 const GRAY_400: Rgb = Rgb(156, 163, 175);
 const GREEN_300: Rgb = Rgb(134, 239, 172);
 const RED_300: Rgb = Rgb(252, 165, 165);
+
+// Vertical rhythm, in px. Every view steps by these, so the four tabs share one spacing.
+/// Section caption to the control under it.
+const CAPTION: i32 = 20;
+/// Between sibling controls.
+const GAP: i32 = 8;
+/// Between groups.
+const GROUP: i32 = 12;
+/// Band sliders sit tighter than other siblings, so the Sound view fits.
+const DENSE: i32 = 2;
+/// Status rows in Setup.
+const ROW: i32 = 22;
+const PILL_H: i32 = 28;
+const SLIDER_H: i32 = 30;
+const TOGGLE_H: i32 = 20;
+const CARD_R: f32 = 22.0;
+/// Width of the content inside the panel's 18 px side padding.
+const CONTENT_W: f32 = (PANEL_W - 36) as f32;
+
+/// Line pitch for wrapped text of size `px`.
+const fn line(px: i32) -> i32 {
+    px + 5
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Preset {
@@ -31,6 +56,17 @@ pub enum Preset {
     Cs2,
     R6s,
     Cod,
+}
+
+impl Preset {
+    pub fn label(self) -> &'static str {
+        match self {
+            Preset::None => "None",
+            Preset::Cs2 => "CS2",
+            Preset::R6s => "R6",
+            Preset::Cod => "CoD",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -72,6 +108,13 @@ impl Settings {
         } else {
             self.apply_preset(p);
         }
+    }
+
+    /// Put back the tuning a preset overwrites (the preset's undo). Everything else stays.
+    pub fn restore_tuning(&mut self, from: &Settings) {
+        self.preset = from.preset;
+        self.sensitivity = from.sensitivity;
+        self.band_gain = from.band_gain;
     }
 
     /// Slider position 0..1. 0 size, 1 opacity, 2 sensitivity, 3.. bands.
@@ -133,8 +176,9 @@ const BANDS: [(&str, &str); 5] = [
     ("Air", INFO_AIR),
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum View {
+    #[default]
     Display,
     Sound,
     Setup,
@@ -153,14 +197,25 @@ pub struct Support {
     pub message: Option<&'static str>,
 }
 
+/// In-app support through Microsoft Store add-ons. Off for now: the Support tab offers only
+/// BackaBuddy, and the app never contacts the Store. Flip to `true` to bring the add-ons back
+/// (also fill in `store::STORE_IDS`).
+pub const STORE_SUPPORT: bool = false;
+
 /// Shown until the Store reports local prices: $3 one-off, $10 one-off, $2 a month.
 pub const SUPPORT_FALLBACK: [&str; 3] = ["$3", "$10", "$2"];
 
-/// Which view is showing, and whether an info card is open over it.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Which view is showing, what's open over it, and where the pointer is.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PanelState {
     pub view: View,
+    /// Info card open over the panel.
     pub help: Option<&'static str>,
+    /// A preset just overwrote the sliders: the undo toast is showing.
+    pub undo: bool,
+    /// The control under the pointer, and whether the button is held on it.
+    pub hot: Option<Action>,
+    pub pressed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -174,6 +229,7 @@ pub enum Action {
     SwapLr,
     FrontBack,
     Preset(Preset),
+    UndoPreset,
     OpenSoundSettings,
     OpenSpatialSettings,
     SelfTest,
@@ -217,7 +273,7 @@ pub struct Panel {
 }
 
 impl Panel {
-    /// Info icons sit on top of their rows, so they win.
+    /// Info icons sit on top of their rows, so they win (they never overlap a slider track).
     pub fn hit(&self, x: i32, y: i32) -> Option<Action> {
         let hits = || self.widgets.iter().filter(move |w| w.contains(x, y));
         hits().find(|w| matches!(w.action, Action::Help(_))).or_else(|| hits().next()).map(|w| w.action)
@@ -239,6 +295,8 @@ struct Builder<'a, 'b> {
     c: Option<&'a mut Canvas<'b>>,
     widgets: Vec<Widget>,
     texts: Vec<Text>,
+    hot: Option<Action>,
+    pressed: bool,
 }
 
 impl<'b> Builder<'_, 'b> {
@@ -254,13 +312,30 @@ impl<'b> Builder<'_, 'b> {
         self.widgets.push(Widget { x0, y0, x1, y1, action });
     }
 
+    /// (under the pointer, held down) for the control that does `action`.
+    fn state(&self, action: Action) -> (bool, bool) {
+        let hot = self.hot == Some(action);
+        (hot, hot && self.pressed)
+    }
+
     /// The website's section card: `rounded-3xl`, dark, hairline white border.
-    fn card(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, fill: f32) {
+    #[allow(clippy::too_many_arguments)]
+    fn card(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, radius: f32, fill: f32) {
         if let Some(c) = self.canvas() {
             let (x0, y0, x1, y1) = (x0 as f32, y0 as f32, x1 as f32, y1 as f32);
-            c.rect(x0, y0, x1, y1, 22.0, BLACK, fill, Paint::Fill);
-            c.rect(x0 + 0.5, y0 + 0.5, x1 - 0.5, y1 - 0.5, 22.0, WHITE, 0.10, Paint::Stroke { width: 1.0, dash: None });
+            c.rect(x0, y0, x1, y1, radius, BLACK, fill, Paint::Fill);
+            c.rect(x0 + 0.5, y0 + 0.5, x1 - 0.5, y1 - 0.5, radius, WHITE, 0.10, Paint::Stroke { width: 1.0, dash: None });
         }
+    }
+
+    /// Wrapped text with its top at `y`; returns the y just below it.
+    #[allow(clippy::too_many_arguments)]
+    fn para(&mut self, s: &str, x: i32, mut y: i32, width: f32, px: i32, font: Font, rgb: Rgb) -> i32 {
+        for l in wrap(s, width, px) {
+            self.text(Text::new(l, x as f32, (y + line(px) / 2) as f32, Anchor::MidLeft, font, px, rgb));
+            y += line(px);
+        }
+        y
     }
 
     /// The site's "HWS" logo: initials in a thin white circle.
@@ -271,24 +346,37 @@ impl<'b> Builder<'_, 'b> {
         self.text(Text::new("HWS", cx as f32 + 0.5, cy as f32, Anchor::Center, Font::SemiBold, 9, WHITE).caps(1));
     }
 
+    /// The site's pills, with its hover (`hover:bg-white/10`, orange-400) and a darker pressed shade.
     #[allow(clippy::too_many_arguments)]
     fn pill(&mut self, x0: i32, y0: i32, x1: i32, h: i32, label: &str, action: Action, kind: Pill) {
+        let (hot, down) = self.state(action);
         let (fx0, fy0, fx1, fy1, r) = (x0 as f32, y0 as f32, x1 as f32, (y0 + h) as f32, h as f32 / 2.0);
         if let Some(c) = self.canvas() {
             match kind {
-                Pill::Primary => c.rect(fx0, fy0, fx1, fy1, r, ORANGE_500, 1.0, Paint::Fill),
+                Pill::Primary => {
+                    let fill = if down { ORANGE_600 } else if hot { ORANGE_400 } else { ORANGE_500 };
+                    c.rect(fx0, fy0, fx1, fy1, r, fill, 1.0, Paint::Fill);
+                }
                 Pill::Secondary => {
                     c.rect(fx0, fy0, fx1, fy1, r, BLACK, 0.40, Paint::Fill);
-                    c.rect(fx0 + 0.5, fy0 + 0.5, fx1 - 0.5, fy1 - 0.5, r, WHITE, 0.35, Paint::Stroke { width: 1.0, dash: None });
+                    if hot {
+                        c.rect(fx0, fy0, fx1, fy1, r, WHITE, if down { 0.16 } else { 0.10 }, Paint::Fill);
+                    }
+                    let edge = if hot { 0.55 } else { 0.35 };
+                    c.rect(fx0 + 0.5, fy0 + 0.5, fx1 - 0.5, fy1 - 0.5, r, WHITE, edge, Paint::Stroke { width: 1.0, dash: None });
                 }
-                Pill::Nav { active: true } => c.rect(fx0, fy0, fx1, fy1, r, WHITE, 0.10, Paint::Fill),
-                Pill::Nav { active: false } => {}
+                Pill::Nav { active } => {
+                    let fill = if active { 0.10 } else { 0.0 } + if down { 0.12 } else if hot { 0.06 } else { 0.0 };
+                    if fill > 0.0 {
+                        c.rect(fx0, fy0, fx1, fy1, r, WHITE, fill, Paint::Fill);
+                    }
+                }
             }
         }
         let (font, rgb, track) = match kind {
             Pill::Primary => (Font::SemiBold, WHITE, 1),
-            Pill::Secondary => (Font::Medium, GRAY_200, 1),
-            Pill::Nav { active } => (if active { Font::SemiBold } else { Font::Medium }, if active { WHITE } else { GRAY_300 }, 2),
+            Pill::Secondary => (Font::Medium, if hot { WHITE } else { GRAY_200 }, 1),
+            Pill::Nav { active } => (if active { Font::SemiBold } else { Font::Medium }, if active || hot { WHITE } else { GRAY_300 }, 2),
         };
         let (cx, cy) = ((x0 + x1) as f32 / 2.0, y0 as f32 + h as f32 / 2.0);
         self.text(Text::new(label, cx, cy, Anchor::Center, font, 10, rgb).caps(track));
@@ -301,16 +389,18 @@ impl<'b> Builder<'_, 'b> {
         let w = (x1 - x0 - 6 * (n - 1)) / n;
         for (i, (label, action, on)) in items.iter().enumerate() {
             let px = x0 + i as i32 * (w + 6);
-            self.pill(px, y, px + w, 28, label, *action, if *on { Pill::Primary } else { Pill::Secondary });
+            self.pill(px, y, px + w, PILL_H, label, *action, if *on { Pill::Primary } else { Pill::Secondary });
         }
     }
 
+    /// The "i" icon: drawn 14 px, clickable over 24×24 (WCAG 2.2 target size).
     fn info(&mut self, cx: i32, cy: i32, text: &'static str) {
+        let (hot, _) = self.state(Action::Help(text));
         if let Some(c) = self.canvas() {
-            c.circle(cx as f32, cy as f32, 7.0, WHITE, 0.30, Paint::Stroke { width: 1.0, dash: None });
+            c.circle(cx as f32, cy as f32, 7.0, WHITE, if hot { 0.60 } else { 0.30 }, Paint::Stroke { width: 1.0, dash: None });
         }
-        self.text(Text::new("i", cx as f32 + 0.5, cy as f32, Anchor::Center, Font::SemiBold, 10, GRAY_300));
-        self.widget(cx - 9, cy - 9, cx + 9, cy + 9, Action::Help(text));
+        self.text(Text::new("i", cx as f32 + 0.5, cy as f32, Anchor::Center, Font::SemiBold, 10, if hot { WHITE } else { GRAY_300 }));
+        self.widget(cx - 12, cy - 12, cx + 12, cy + 12, Action::Help(text));
     }
 
     /// Section caption: the site's small uppercase letter-spaced grey label.
@@ -321,67 +411,92 @@ impl<'b> Builder<'_, 'b> {
         }
     }
 
+    /// Label and value on top, the track below. The info icon sits beside the track's end rather
+    /// than above it, so its target and the track's never overlap.
     #[allow(clippy::too_many_arguments)]
     fn slider(&mut self, i: usize, x0: i32, y: i32, x1: i32, label: &str, value: String, t: f32, info: &'static str) {
-        self.text(Text::new(label, x0 as f32, y as f32 + 7.0, Anchor::MidLeft, Font::Regular, 12, GRAY_200));
-        self.text(Text::new(value, (x1 - 22) as f32, y as f32 + 7.0, Anchor::MidRight, Font::Mono, 11, GRAY_300));
-        self.info(x1 - 7, y + 7, info);
-        let (fx0, fx1, ty) = (x0 as f32, x1 as f32, y as f32 + 21.0);
+        let (hot, down) = self.state(Action::Slider(i));
+        let tx1 = x1 - 26;
+        self.text(Text::new(label, x0 as f32, y as f32 + 7.0, Anchor::MidLeft, Font::Regular, 12, if hot { WHITE } else { GRAY_200 }));
+        self.text(Text::new(value, tx1 as f32, y as f32 + 7.0, Anchor::MidRight, Font::Mono, 11, GRAY_300));
+        self.info(x1 - 7, y + 21, info);
+        let (fx0, fx1, ty) = (x0 as f32, tx1 as f32, y as f32 + 21.0);
         let knob = fx0 + t * (fx1 - fx0);
         if let Some(c) = self.canvas() {
             c.rect(fx0, ty - 1.5, fx1, ty + 1.5, 1.5, WHITE, 0.15, Paint::Fill);
             c.rect(fx0, ty - 1.5, knob, ty + 1.5, 1.5, ORANGE_500, 1.0, Paint::Fill);
+            if hot {
+                c.circle(knob, ty, if down { 12.0 } else { 10.0 }, ORANGE_500, 0.25, Paint::Fill);
+            }
             c.circle(knob, ty, 7.0, BLACK, 0.35, Paint::Fill);
             c.circle(knob, ty, 6.0, WHITE, 1.0, Paint::Fill);
         }
-        self.widget(x0, y + 12, x1, y + 30, Action::Slider(i));
+        self.widget(x0, y + 10, tx1, y + SLIDER_H + 1, Action::Slider(i));
     }
 
+    /// A switch; the whole row (label included) toggles it.
     #[allow(clippy::too_many_arguments)]
     fn toggle(&mut self, x0: i32, y: i32, x1: i32, label: &str, on: bool, action: Action, info: Option<&'static str>) {
-        self.text(Text::new(label, x0 as f32, y as f32 + 10.0, Anchor::MidLeft, Font::Regular, 12, GRAY_200));
+        let (hot, down) = self.state(action);
+        self.text(Text::new(label, x0 as f32, y as f32 + 10.0, Anchor::MidLeft, Font::Regular, 12, if hot { WHITE } else { GRAY_200 }));
         let (sx0, sx1, sy) = ((x1 - 58) as f32, (x1 - 28) as f32, y as f32 + 10.0);
         if let Some(c) = self.canvas() {
             if on {
-                c.rect(sx0, sy - 8.0, sx1, sy + 8.0, 8.0, ORANGE_500, 1.0, Paint::Fill);
+                let fill = if down { ORANGE_600 } else if hot { ORANGE_400 } else { ORANGE_500 };
+                c.rect(sx0, sy - 8.0, sx1, sy + 8.0, 8.0, fill, 1.0, Paint::Fill);
             } else {
-                c.rect(sx0, sy - 8.0, sx1, sy + 8.0, 8.0, WHITE, 0.20, Paint::Fill);
+                c.rect(sx0, sy - 8.0, sx1, sy + 8.0, 8.0, WHITE, if hot { 0.30 } else { 0.20 }, Paint::Fill);
             }
             c.circle(if on { sx1 - 8.0 } else { sx0 + 8.0 }, sy, 6.0, WHITE, 1.0, Paint::Fill);
         }
         if let Some(t) = info {
             self.info(x1 - 7, y + 10, t);
         }
-        self.widget(x0, y, x1 - 18, y + 20, action);
+        self.widget(x0, y, x1 - 20, y + TOGGLE_H, action);
     }
 
-    /// Info text in a card over the bottom of the panel; any click closes it.
+    /// Info text in a card over the bottom of the panel; any click (or Escape) closes it.
     fn help_card(&mut self, (x0, y0, x1, y1): (i32, i32, i32, i32), text: &str) {
-        let lines = wrap(text, 46);
-        let h = 22 + 17 * lines.len() as i32 + 14 + 28 + 16;
-        let (cx0, cy0, cx1, cy1) = (x0 + 10, y1 - 12 - h, x1 - 10, y1 - 12);
-        self.card(cx0, cy0, cx1, cy1, 0.96);
+        const INSET: i32 = 10;
+        const PAD: i32 = 18;
+        let lines = wrap(text, (x1 - x0 - 2 * (INSET + PAD)) as f32, 12);
+        let h = PAD + line(12) * lines.len() as i32 + GROUP + PILL_H + PAD;
+        let (cx0, cy0, cx1, cy1) = (x0 + INSET, y1 - INSET - h, x1 - INSET, y1 - INSET);
+        // Nested in the panel's corner: inner radius = outer radius - inset.
+        self.card(cx0, cy0, cx1, cy1, CARD_R - INSET as f32, 0.96);
         // Text is drawn after every shape, so the card can't hide what's under it by painting
         // over; drop that text instead.
         self.texts.retain(|t| t.y < cy0 as f32 || t.y > cy1 as f32);
-        let mut y = cy0 + 22;
-        for (i, line) in lines.iter().enumerate() {
+        let mut y = cy0 + PAD;
+        for (i, l) in lines.into_iter().enumerate() {
             let (font, rgb) = if i == 0 { (Font::SemiBold, ORANGE_300) } else { (Font::Regular, GRAY_200) };
-            self.text(Text::new(line.clone(), (cx0 + 18) as f32, y as f32, Anchor::MidLeft, font, 12, rgb));
-            y += 17;
+            self.text(Text::new(l, (cx0 + PAD) as f32, (y + line(12) / 2) as f32, Anchor::MidLeft, font, 12, rgb));
+            y += line(12);
         }
         let mid = (cx0 + cx1) / 2;
-        self.pill(mid - 50, cy1 - 16 - 28, mid + 50, 28, "Got it", Action::CloseHelp, Pill::Secondary);
+        self.pill(mid - 50, cy1 - PAD - PILL_H, mid + 50, PILL_H, "Got it", Action::CloseHelp, Pill::Secondary);
         // While it's open, a click anywhere just closes it.
         self.widgets = vec![Widget { x0, y0, x1, y1, action: Action::CloseHelp }];
+    }
+
+    /// The undo toast, in place of the hotkey footer for a few seconds after a preset.
+    fn toast(&mut self, x0: i32, x1: i32, y1: i32, msg: &str) {
+        let (tx0, ty0, tx1, ty1) = (x0 + 10, y1 - 34, x1 - 10, y1 - 6);
+        if let Some(c) = self.canvas() {
+            let r = (ty1 - ty0) as f32 / 2.0;
+            c.rect(tx0 as f32, ty0 as f32, tx1 as f32, ty1 as f32, r, WHITE, 0.12, Paint::Fill);
+        }
+        let cy = (ty0 + ty1) / 2;
+        self.text(Text::new(msg, (tx0 + 16) as f32, cy as f32, Anchor::MidLeft, Font::Regular, 12, GRAY_200));
+        self.pill(tx1 - 4 - 64, cy - 10, tx1 - 4, 20, "Undo", Action::UndoPreset, Pill::Primary);
     }
 }
 
 /// Lay out (and, given a canvas, draw) the settings panel with its top-left at `(x0, y0)`.
 pub fn panel(c: Option<&mut Canvas>, (x0, y0): (i32, i32), st: PanelState, s: &Settings, info: &SetupInfo) -> Panel {
-    let mut b = Builder { c, widgets: Vec::new(), texts: Vec::new() };
+    let mut b = Builder { c, widgets: Vec::new(), texts: Vec::new(), hot: st.hot, pressed: st.pressed };
     let (x1, y1) = (x0 + PANEL_W, y0 + PANEL_H);
-    b.card(x0, y0, x1, y1, 0.92); // the site uses 55% + blur; with no blur, over a game, it needs more
+    b.card(x0, y0, x1, y1, CARD_R, 0.92); // the site uses 55% + blur; with no blur, over a game, it needs more
     let (ix0, ix1) = (x0 + 18, x1 - 18);
 
     // header, like the website's floating nav bar
@@ -411,9 +526,13 @@ pub fn panel(c: Option<&mut Canvas>, (x0, y0): (i32, i32), st: PanelState, s: &S
         View::Display => display(&mut b, top, ix0, ix1, s),
         View::Sound => sound(&mut b, top, ix0, ix1, s),
         View::Setup => setup(&mut b, top, ix0, ix1, info),
-        View::Support => support(&mut b, top, ix0, ix1, &info.support),
+        View::Support => support(&mut b, top, ix0, ix1, &info.support, STORE_SUPPORT),
     }
-    b.text(Text::new("ALT+H hide · ALT+G game only · ALT+Q quit", ((x0 + x1) / 2) as f32, (y1 - FOOTER_H / 2 - 2) as f32, Anchor::Center, Font::Mono, 10, GRAY_400));
+    if st.undo {
+        b.toast(x0, x1, y1, &format!("{} preset applied", s.preset.label()));
+    } else {
+        b.text(Text::new("ALT+H hide · ALT+G game only · ALT+Q quit", ((x0 + x1) / 2) as f32, (y1 - FOOTER_H / 2 - 2) as f32, Anchor::Center, Font::Mono, 10, GRAY_400));
+    }
     if let Some(h) = st.help {
         b.help_card((x0, y0, x1, y1), h);
     }
@@ -423,31 +542,31 @@ pub fn panel(c: Option<&mut Canvas>, (x0, y0): (i32, i32), st: PanelState, s: &S
 fn display(b: &mut Builder, mut y: i32, ix0: i32, ix1: i32, s: &Settings) {
     let hud = s.hud;
     b.section(ix0, ix1, y, "HUD style", Some(INFO_STYLE));
-    y += 20;
+    y += CAPTION;
     b.choices(ix0, y, ix1, &[
         ("Orbit", Action::Style(HudStyle::Orbit), hud.style == HudStyle::Orbit),
         ("Radar", Action::Style(HudStyle::Radar), hud.style == HudStyle::Radar),
         ("Tape", Action::Style(HudStyle::Tape), hud.style == HudStyle::Tape),
     ]);
-    y += 40;
+    y += PILL_H + GROUP;
     if hud.style == HudStyle::Radar {
         b.toggle(ix0, y, ix1, "Crosshair mode", hud.crosshair, Action::Crosshair, None);
-        y += 32;
+        y += TOGGLE_H + GROUP;
     }
     b.section(ix0, ix1, y, "Colours", Some(INFO_COLOURS));
-    y += 20;
+    y += CAPTION;
     b.choices(ix0, y, ix1, &[
         ("Brand", Action::Palette(PaletteKind::Brand), hud.palette == PaletteKind::Brand),
         ("Colour-blind", Action::Palette(PaletteKind::ColorBlind), hud.palette == PaletteKind::ColorBlind),
         ("Contrast", Action::Palette(PaletteKind::HighContrast), hud.palette == PaletteKind::HighContrast),
     ]);
-    y += 46;
+    y += PILL_H + GROUP;
     b.section(ix0, ix1, y, "Display", None);
-    y += 20;
+    y += CAPTION;
     b.slider(0, ix0, y, ix1, "Size", s.slider_value(0), s.slider(0), INFO_SIZE);
-    y += 38;
+    y += SLIDER_H + GAP;
     b.slider(1, ix0, y, ix1, "Opacity", s.slider_value(1), s.slider(1), INFO_OPACITY);
-    y += 46;
+    y += SLIDER_H + GROUP;
     // The HUD and this panel are separate windows; say how to move them (the HUD itself is too
     // tight to carry a hint without covering its own labels).
     let hint = if hud.style == HudStyle::Radar && hud.crosshair {
@@ -455,33 +574,26 @@ fn display(b: &mut Builder, mut y: i32, ix0: i32, ix1: i32, s: &Settings) {
     } else {
         "Drag the HUD, or an empty part of this panel, to move it."
     };
-    for line in wrap(hint, 52) {
-        b.text(Text::new(line, ix0 as f32, y as f32, Anchor::MidLeft, Font::Regular, 11, GRAY_400));
-        y += 16;
-    }
+    b.para(hint, ix0, y, CONTENT_W, 11, Font::Regular, GRAY_400);
 }
 
 fn sound(b: &mut Builder, mut y: i32, ix0: i32, ix1: i32, s: &Settings) {
     b.section(ix0, ix1, y, "Game preset", Some(INFO_PRESET));
-    y += 20;
-    b.choices(ix0, y, ix1, &[
-        ("None", Action::Preset(Preset::None), s.preset == Preset::None),
-        ("CS2", Action::Preset(Preset::Cs2), s.preset == Preset::Cs2),
-        ("R6", Action::Preset(Preset::R6s), s.preset == Preset::R6s),
-        ("CoD", Action::Preset(Preset::Cod), s.preset == Preset::Cod),
-    ]);
-    y += 42;
+    y += CAPTION;
+    let presets = [Preset::None, Preset::Cs2, Preset::R6s, Preset::Cod].map(|p| (p.label(), Action::Preset(p), s.preset == p));
+    b.choices(ix0, y, ix1, &presets);
+    y += PILL_H + GROUP;
     b.slider(2, ix0, y, ix1, "Sensitivity", s.slider_value(2), s.slider(2), INFO_SENS);
-    y += 40;
+    y += SLIDER_H + GROUP;
     b.section(ix0, ix1, y, "Bands", None);
-    y += 18;
+    y += CAPTION;
     for (k, (label, help)) in BANDS.iter().enumerate() {
         b.slider(3 + k, ix0, y, ix1, label, s.slider_value(3 + k), s.slider(3 + k), help);
-        y += 32;
+        y += SLIDER_H + DENSE;
     }
-    y += 4;
+    y += GAP - DENSE;
     b.toggle(ix0, y, ix1, "Swap left / right", s.swap_lr, Action::SwapLr, Some(INFO_SWAP));
-    y += 28;
+    y += TOGGLE_H + GAP;
     b.toggle(ix0, y, ix1, "Guess front / back (beta)", s.front_back, Action::FrontBack, Some(INFO_FB));
 }
 
@@ -504,81 +616,70 @@ fn setup(b: &mut Builder, mut y: i32, ix0: i32, ix1: i32, info: &SetupInfo) {
         rows.push(("Game only", "Needs Win10 build 20348+".into(), ORANGE_300));
     }
     b.section(ix0, ix1, y, "Audio setup", None);
-    y += 22;
+    y += CAPTION;
     for (k, v, rgb) in rows {
-        b.text(Text::new(k, ix0 as f32, y as f32, Anchor::MidLeft, Font::Regular, 12, GRAY_400));
-        b.text(Text::new(v, (ix0 + 96) as f32, y as f32, Anchor::MidLeft, Font::Medium, 12, rgb));
-        y += 22;
+        let cy = (y + line(12) / 2) as f32;
+        b.text(Text::new(k, ix0 as f32, cy, Anchor::MidLeft, Font::Regular, 12, GRAY_400));
+        b.text(Text::new(v, (ix0 + 96) as f32, cy, Anchor::MidLeft, Font::Medium, 12, rgb));
+        y += ROW;
     }
-    y += 2;
     let hint = if full360 {
         "Keep Spatial sound off in Windows for the most accurate direction."
     } else {
         "Stereo can't tell front from back. For 360°, set Windows output to 7.1 and turn Spatial sound off."
     };
-    for line in wrap(hint, 50) {
-        b.text(Text::new(line, ix0 as f32, y as f32, Anchor::MidLeft, Font::Regular, 12, GRAY_300));
-        y += 17;
-    }
-    y += 10;
-    b.pill(ix0, y, ix1, 30, "Windows sound settings", Action::OpenSoundSettings, Pill::Secondary);
-    y += 38;
-    b.pill(ix0, y, ix1, 30, "Spatial sound settings", Action::OpenSpatialSettings, Pill::Secondary);
-    y += 38;
+    y = b.para(hint, ix0, y, CONTENT_W, 12, Font::Regular, GRAY_300) + GROUP;
+    b.pill(ix0, y, ix1, PILL_H, "Windows sound settings", Action::OpenSoundSettings, Pill::Secondary);
+    y += PILL_H + GAP;
+    b.pill(ix0, y, ix1, PILL_H, "Spatial sound settings", Action::OpenSpatialSettings, Pill::Secondary);
+    y += PILL_H + GAP;
+    // Clicking again while it runs stops it.
     let (label, kind) = match info.self_test {
         None => ("Test left / right", Pill::Secondary),
-        Some(0) => ("Testing · left ‹", Pill::Primary),
-        Some(1) => ("Testing · right ›", Pill::Primary),
-        Some(_) => ("Testing…", Pill::Primary),
+        Some(0) => ("Testing left ‹ · stop", Pill::Primary),
+        Some(1) => ("Testing right › · stop", Pill::Primary),
+        Some(_) => ("Testing… · stop", Pill::Primary),
     };
-    b.pill(ix0, y, ix1, 30, label, Action::SelfTest, kind);
-    y += 42;
-    b.text(Text::new("If sides look reversed, turn on Swap left / right in Sound.", ix0 as f32, y as f32, Anchor::MidLeft, Font::Regular, 11, GRAY_400));
+    b.pill(ix0, y, ix1, PILL_H, label, Action::SelfTest, kind);
+    y += PILL_H + GROUP;
+    b.para("If sides look reversed, turn on Swap left / right in Sound.", ix0, y, CONTENT_W, 11, Font::Regular, GRAY_400);
 }
 
 /// Optional support: Store add-ons ($3 / $10 one-off, $2 a month) and BackaBuddy. Everything in
 /// the app stays free; this tab only ever asks.
-fn support(b: &mut Builder, mut y: i32, ix0: i32, ix1: i32, sup: &Support) {
+fn support(b: &mut Builder, mut y: i32, ix0: i32, ix1: i32, sup: &Support, store: bool) {
     b.section(ix0, ix1, y, "Support the project", None);
-    y += 22;
+    y += CAPTION;
     let intro = "Heroes Without Sound is free, and every feature stays free. If it helps you play, you can chip in to keep it going.";
-    for line in wrap(intro, 50) {
-        b.text(Text::new(line, ix0 as f32, y as f32, Anchor::MidLeft, Font::Regular, 12, GRAY_300));
-        y += 17;
-    }
-    y += 6;
+    y = b.para(intro, ix0, y, CONTENT_W, 12, Font::Regular, GRAY_300) + GROUP;
     if sup.supporter {
-        b.text(Text::new("You're a supporter. Thank you!", ix0 as f32, y as f32, Anchor::MidLeft, Font::Medium, 12, ORANGE_300));
-        y += 22;
+        y = b.para("You're a supporter. Thank you!", ix0, y, CONTENT_W, 12, Font::Medium, ORANGE_300) + GAP;
     }
-    let price = |i: usize| sup.prices[i].clone().unwrap_or_else(|| SUPPORT_FALLBACK[i].to_string());
-    let half = (ix1 - ix0 - 6) / 2;
-    b.pill(ix0, y, ix0 + half, 30, &format!("One-off · {}", price(0)), Action::Buy(0), Pill::Secondary);
-    b.pill(ix1 - half, y, ix1, 30, &format!("One-off · {}", price(1)), Action::Buy(1), Pill::Secondary);
-    y += 38;
-    let monthly = if sup.busy { "Opening the Store…".to_string() } else { format!("Monthly · {}/mo", price(2)) };
-    b.pill(ix0, y, ix1, 30, &monthly, Action::Buy(2), Pill::Primary);
-    y += 40;
-    let status = match (sup.message, sup.available) {
-        (Some(m), _) => Some(m),
-        (None, None) => Some("Checking the Microsoft Store…"),
-        _ => None,
-    };
-    if let Some(m) = status {
-        for line in wrap(m, 52) {
-            b.text(Text::new(line, ix0 as f32, y as f32, Anchor::MidLeft, Font::Regular, 11, GRAY_400));
-            y += 16;
+    if store {
+        let price = |i: usize| sup.prices[i].clone().unwrap_or_else(|| SUPPORT_FALLBACK[i].to_string());
+        let half = (ix1 - ix0 - 6) / 2;
+        b.pill(ix0, y, ix0 + half, PILL_H, &format!("One-off · {}", price(0)), Action::Buy(0), Pill::Secondary);
+        b.pill(ix1 - half, y, ix1, PILL_H, &format!("One-off · {}", price(1)), Action::Buy(1), Pill::Secondary);
+        y += PILL_H + GAP;
+        let monthly = if sup.busy { "Opening the Store…".to_string() } else { format!("Monthly · {}/mo", price(2)) };
+        b.pill(ix0, y, ix1, PILL_H, &monthly, Action::Buy(2), Pill::Primary);
+        y += PILL_H + GROUP;
+        let status = match (sup.message, sup.available) {
+            (Some(m), _) => Some(m),
+            (None, None) => Some("Checking the Microsoft Store…"),
+            _ => None,
+        };
+        if let Some(m) = status {
+            y = b.para(m, ix0, y, CONTENT_W, 11, Font::Regular, GRAY_400) + GAP;
         }
-        y += 6;
+        b.section(ix0, ix1, y, "Prefer not to use the Store?", None);
+        y += CAPTION;
     }
-    b.section(ix0, ix1, y, "Prefer not to use the Store?", None);
-    y += 20;
-    b.pill(ix0, y, ix1, 30, "Support on BackaBuddy", Action::OpenBackaBuddy, Pill::Secondary);
-    y += 42;
-    for line in wrap("Support is a thank-you, not a purchase: nothing in the app is locked.", 54) {
-        b.text(Text::new(line, ix0 as f32, y as f32, Anchor::MidLeft, Font::Regular, 11, GRAY_400));
-        y += 16;
-    }
+    // Without the Store options, BackaBuddy is the one way to support, so it's the primary pill.
+    let kind = if store { Pill::Secondary } else { Pill::Primary };
+    b.pill(ix0, y, ix1, PILL_H, "Support on BackaBuddy", Action::OpenBackaBuddy, kind);
+    y += PILL_H + GROUP;
+    b.para("Support is a thank-you, not a purchase: nothing in the app is locked.", ix0, y, CONTENT_W, 11, Font::Regular, GRAY_400);
 }
 
 #[cfg(test)]
@@ -593,7 +694,7 @@ mod tests {
     const ORIGIN: (i32, i32) = (10, 250);
 
     fn st(view: View) -> PanelState {
-        PanelState { view, help: None }
+        PanelState { view, ..Default::default() }
     }
 
     #[test]
@@ -625,14 +726,32 @@ mod tests {
     fn an_open_info_card_takes_every_click_and_fits_the_panel() {
         let s = Settings::default();
         for help in [INFO_STYLE, INFO_FB, INFO_SIZE] {
-            let p = panel(None, ORIGIN, PanelState { view: View::Sound, help: Some(help) }, &s, &SetupInfo::default());
+            let p = panel(None, ORIGIN, PanelState { view: View::Sound, help: Some(help), ..Default::default() }, &s, &SetupInfo::default());
             assert_eq!(p.hit(ORIGIN.0 + 20, ORIGIN.1 + 70), Some(Action::CloseHelp));
             assert_eq!(p.widgets.len(), 1);
             let underneath = p.texts.iter().filter(|t| t.s == "ALT+H hide · ALT+G game only · ALT+Q quit").count();
             assert_eq!(underneath, 0, "text under the card must not draw over it");
-            let lines = wrap(help, 46).len() as i32;
-            assert!(22 + 17 * lines + 58 < PANEL_H - 24, "help card too tall for {help:.20}");
+            let title = p.texts.iter().find(|t| t.rgb == ORANGE_300).expect("help title");
+            assert!(title.y > (ORIGIN.1 + 10 + 18) as f32, "help card too tall for {help:.20}");
         }
+    }
+
+    /// The Support tab built with the Store options on or off, regardless of `STORE_SUPPORT`.
+    fn support_panel(sup: &Support, store: bool) -> Panel {
+        let mut b = Builder { c: None, widgets: Vec::new(), texts: Vec::new(), hot: None, pressed: false };
+        support(&mut b, ORIGIN.1 + 106, ORIGIN.0 + 18, ORIGIN.0 + PANEL_W - 18, sup, store);
+        Panel { widgets: b.widgets, texts: b.texts }
+    }
+
+    #[test]
+    fn with_store_support_off_only_backabuddy_is_offered() {
+        let p = support_panel(&Support::default(), false);
+        assert!(!p.widgets.iter().any(|w| matches!(w.action, Action::Buy(_))), "Store options must be hidden");
+        assert!(p.widgets.iter().any(|w| w.action == Action::OpenBackaBuddy));
+        assert!(!p.texts.iter().any(|t| t.s.contains("Store")), "no mention of the Store when it's off");
+        // and the real panel follows the switch
+        let real = panel(None, ORIGIN, st(View::Support), &Settings::default(), &SetupInfo::default());
+        assert_eq!(real.widgets.iter().any(|w| matches!(w.action, Action::Buy(_))), STORE_SUPPORT);
     }
 
     #[test]
@@ -640,8 +759,7 @@ mod tests {
         let s = Settings::default();
         // the tallest case: supporter line + a two-line status message
         let support = Support { supporter: true, message: Some("The Store couldn't complete that. Please try again."), ..Default::default() };
-        let info = SetupInfo { support, ..Default::default() };
-        let p = panel(None, ORIGIN, st(View::Support), &s, &info);
+        let p = support_panel(&support, true);
         for a in [Action::Buy(0), Action::Buy(1), Action::Buy(2), Action::OpenBackaBuddy] {
             let w = p.widgets.iter().find(|w| w.action == a).unwrap_or_else(|| panic!("{a:?} missing"));
             assert!(w.y1 <= ORIGIN.1 + PANEL_H - FOOTER_H, "{a:?} over the footer");
@@ -651,7 +769,7 @@ mod tests {
         // fallback prices until the Store answers, the Store's own once it has
         assert!(p.texts.iter().any(|t| t.s == "One-off · $3") && p.texts.iter().any(|t| t.s == "Monthly · $2/mo"));
         let local = Support { prices: [Some("R55.00".into()), None, None], ..Default::default() };
-        let p = panel(None, ORIGIN, st(View::Support), &s, &SetupInfo { support: local, ..Default::default() });
+        let p = support_panel(&local, true);
         assert!(p.texts.iter().any(|t| t.s == "One-off · R55.00"));
         // the badge replaces the hotkey hint for supporters only
         let badge = |sup: bool| {
@@ -659,6 +777,37 @@ mod tests {
             panel(None, ORIGIN, st(View::Display), &s, &info).texts.iter().any(|t| t.s == "Supporter")
         };
         assert!(badge(true) && !badge(false));
+    }
+
+    #[test]
+    fn undo_toast_replaces_the_footer_and_restores_the_tuning() {
+        let mut s = Settings::default();
+        s.band_gain[0] = 2.5;
+        let before = s;
+        s.toggle_preset(Preset::Cs2);
+        s.swap_lr = true; // changed after the preset: undo must keep it
+        let p = panel(None, ORIGIN, PanelState { view: View::Sound, undo: true, ..Default::default() }, &s, &SetupInfo::default());
+        assert!(p.texts.iter().any(|t| t.s == "CS2 preset applied"));
+        assert!(!p.texts.iter().any(|t| t.s.starts_with("ALT+H")), "the toast takes the footer's place");
+        let (x, y) = centre(&p, Action::UndoPreset);
+        assert_eq!(p.hit(x, y), Some(Action::UndoPreset));
+        assert!(y < ORIGIN.1 + PANEL_H);
+        s.restore_tuning(&before);
+        assert_eq!((s.preset, s.band_gain, s.sensitivity, s.swap_lr), (Preset::None, before.band_gain, 1.0, true));
+    }
+
+    #[test]
+    fn info_targets_are_24px_and_never_cover_a_slider_track() {
+        for view in [View::Display, View::Sound] {
+            let p = panel(None, ORIGIN, st(view), &Settings::default(), &SetupInfo::default());
+            for i in p.widgets.iter().filter(|w| matches!(w.action, Action::Help(_))) {
+                assert!(i.x1 - i.x0 >= 24 && i.y1 - i.y0 >= 24);
+                for t in p.widgets.iter().filter(|w| matches!(w.action, Action::Slider(_))) {
+                    let overlap = i.x0 <= t.x1 && t.x0 <= i.x1 && i.y0 <= t.y1 && t.y0 <= i.y1;
+                    assert!(!overlap, "{:?} covers {:?}", i.action, t.action);
+                }
+            }
+        }
     }
 
     #[test]

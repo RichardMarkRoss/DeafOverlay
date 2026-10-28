@@ -67,6 +67,10 @@ A Cargo workspace that replaces the C++ app, with feature parity plus the new di
     - The look: a rounded dark card, the HWS mark, uppercase letter-spaced nav pills, orange-500 primary pills, outlined secondary pills, orange-filled sliders with value readouts, and switch toggles.
     - Views: Display / Sound / Setup / Support. Info icons open an inline help card, not a message box.
     - A single `panel()` builder does both the drawing (given a canvas) and the list of clickable widgets, so drawing and hit-testing can't drift apart like v1's did. Add controls there only.
+    - Spacing comes from the rhythm consts at the top of `ui.rs` (`CAPTION`, `GAP`, `GROUP`, `PILL_H`, …). Step through them rather than adding one-off numbers. The Sound view is within 2 px of the footer, and the tests catch overflow.
+    - Hover and pressed looks come from `PanelState::hot` / `pressed`. `App::pointer` fills them each frame from the cursor, and `PANEL_HAND` gives the hand cursor. Info targets are 24×24 and sit beside slider tracks, never over them (there's a test for that).
+    - Applying a preset happens immediately, then an undo toast replaces the footer for `UNDO_FOR` (`Settings::restore_tuning`). Escape on the focused panel closes the info card, then the panel.
+    - `text::wrap` measures with Geist's real advance widths (`GEIST_ADVANCE`) and balances lines like CSS `text-wrap: balance`. `gfx::rect` draws continuous (squircle) corners on anything that isn't a full pill.
   - `main.rs` is the Win32 shell. It follows the same rules as v1: the window size comes from the DIB, `HTTRANSPARENT` makes it click-through, and Alt+H/I/G/Q are the hotkeys.
     - The HUD and the settings panel are two separate layered windows, so each can be placed on its own. `wnd_proc` tells them apart via `PANEL_HWND`.
     - The panel window is shown and hidden with Alt+I and can be dragged by any empty part of the card.
@@ -74,6 +78,7 @@ A Cargo workspace that replaces the C++ app, with feature parity plus the new di
     - `win` is the HUD's own top-left on screen. Style and size changes keep the HUD centred (`change_hud` / `place_hud`). Crosshair mode is always pinned to the screen centre and stays click-through.
     - Both positions persist (`persist::Positions`: `winX/Y` and `panelX/Y`). The panel first opens beside the HUD.
   - `store.rs` (bin only) handles optional support through Microsoft Store add-ons (`Windows.Services.Store`): $3 and $10 one-off (Durable) and $2/month (Subscription). Every feature stays free; supporters just get a header badge.
+    - **Currently switched off** (`ui::STORE_SUPPORT = false`): the Support tab offers only BackaBuddy and the app never contacts the Store. Set it to `true` (and fill `STORE_IDS`) to bring the add-ons back; the website's privacy policy (`heroes-without-sound/app/privacy/page.tsx`) must then describe the Store check again.
     - `STORE_IDS` holds the add-ons' Partner Center Store IDs. They're empty until the add-ons exist, and the panel then says so.
     - Prices shown are the Store's localised `FormattedPrice`. `ui::SUPPORT_FALLBACK` is the label shown until the Store answers.
     - Store calls run on worker threads and report back over a channel (`poll()` each frame). The purchase dialog is owned by the panel window via `IInitializeWithWindow`, which keeps it above the topmost overlay.

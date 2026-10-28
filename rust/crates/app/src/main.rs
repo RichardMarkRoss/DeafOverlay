@@ -49,6 +49,11 @@ const HK_GAME: i32 = 4;
 static HUD_INTERACTIVE: AtomicBool = AtomicBool::new(false);
 /// Tells `wnd_proc` which of the two windows a message is for.
 static PANEL_HWND: AtomicIsize = AtomicIsize::new(0);
+/// The pointer is over a panel control (set each frame): `wnd_proc` shows the hand cursor.
+static PANEL_HAND: AtomicBool = AtomicBool::new(false);
+
+/// How long the undo toast stays after a preset overwrites the sliders.
+const UNDO_FOR: Duration = Duration::from_secs(6);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Which {
@@ -64,6 +69,8 @@ enum Ev {
     Down(Which, i32, i32),
     Move(i32), // x only: sliders are horizontal
     Up,
+    /// Escape on the focused panel: closes the info card, else the panel.
+    Escape,
 }
 
 thread_local! {
@@ -327,6 +334,8 @@ struct App {
     proc_name: (u32, String),
     /// Optional support (Store add-ons); see `store`.
     store: store::Store,
+    /// The tuning from before the last preset, while its undo toast is showing.
+    undo: Option<(Settings, Instant)>,
 }
 
 impl App {
@@ -405,6 +414,7 @@ impl App {
             self.save();
             self.view = View::Display;
             self.help = None;
+            self.undo = None;
             self.drag = Drag::None;
             self.tone = None; // stops the self-test
             unsafe {
@@ -418,7 +428,28 @@ impl App {
     }
 
     fn panel_state(&self) -> PanelState {
-        PanelState { view: self.view, help: self.help }
+        PanelState { view: self.view, help: self.help, undo: self.undo.is_some(), ..Default::default() }
+    }
+
+    /// The panel control under the mouse, and whether the button is held on it: hover and pressed
+    /// looks, and the hand cursor. A slider being dragged stays hot even off its track.
+    fn pointer(&self, info: &SetupInfo) -> (Option<Action>, bool) {
+        if let Drag::Slider { i, .. } = self.drag {
+            return (Some(Action::Slider(i)), true);
+        }
+        let mut pt = POINT::default();
+        let (px, py) = self.panel_pos.unwrap_or_default();
+        // WindowFromPoint skips other windows on top and our own transparent corners.
+        if unsafe { GetCursorPos(&mut pt).is_err() || WindowFromPoint(pt) != self.panel } {
+            return (None, false);
+        }
+        let hot = ui::panel(None, (0, 0), self.panel_state(), &self.settings, info).hit(pt.x - px, pt.y - py);
+        let down = unsafe {
+            // physical button state, so map the primary button through a left-handed swap
+            let vk = if GetSystemMetrics(SM_SWAPBUTTON) != 0 { VK_RBUTTON } else { VK_LBUTTON };
+            GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000 != 0
+        };
+        (hot, down && hot.is_some())
     }
 
     fn push_dsp_settings(&self) {
@@ -448,6 +479,11 @@ impl App {
         }
         match ev {
             Ev::Down(Which::Panel, x, y) => self.panel_down(x, y),
+            Ev::Escape => {
+                if self.help.take().is_none() {
+                    self.set_settings_mode(false);
+                }
+            }
             Ev::Down(Which::Hud, _, _) => {
                 if !self.crosshair() {
                     if let Some(p) = drag_window(self.hud) {
@@ -495,6 +531,9 @@ impl App {
             Action::Help(text) => self.help = Some(text),
             Action::CloseHelp => self.help = None,
             Action::Slider(i) => {
+                if i >= 2 {
+                    self.undo = None; // tuning by hand now: the preset's undo would throw this away
+                }
                 let (x0, x1) = panel.slider_span(i).unwrap_or((0, 1));
                 self.drag = Drag::Slider { i, x0, x1 };
                 unsafe { SetCapture(self.panel) };
@@ -524,18 +563,28 @@ impl App {
                 self.save();
             }
             Action::Preset(p) => {
+                let before = self.settings;
                 self.settings.toggle_preset(p);
+                // Applying a preset overwrites the sliders: apply at once, offer undo for a while.
+                let changed = (before.sensitivity, before.band_gain) != (self.settings.sensitivity, self.settings.band_gain);
+                self.undo = changed.then(|| (before, Instant::now()));
                 self.push_dsp_settings();
                 self.save();
+            }
+            Action::UndoPreset => {
+                if let Some((before, _)) = self.undo.take() {
+                    self.settings.restore_tuning(&before);
+                    self.push_dsp_settings();
+                    self.save();
+                }
             }
             Action::OpenSoundSettings => open_url("ms-settings:sound"),
             Action::OpenSpatialSettings => open_url("ms-settings:sound-defaultoutputproperties"),
             Action::Buy(i) => self.store.buy(i),
             Action::OpenBackaBuddy => open_url(store::BACKABUDDY),
             Action::SelfTest => {
-                if self.tone.is_none() {
-                    self.tone = Some(Tone::start());
-                }
+                // Again while it runs: stop it.
+                self.tone = if self.tone.is_some() { None } else { Some(Tone::start()) };
             }
             Action::Show(v) => self.view = v,
         }
@@ -544,6 +593,9 @@ impl App {
     fn frame(&mut self, dt: f32) {
         if self.tone.as_ref().is_some_and(Tone::finished) {
             self.tone = None;
+        }
+        if self.undo.is_some_and(|(_, t)| t.elapsed() > UNDO_FOR) {
+            self.undo = None;
         }
         self.store.poll();
         let st = self.capture.status();
@@ -572,7 +624,9 @@ impl App {
 
         if open {
             let info = self.setup_info();
-            let st = self.panel_state();
+            let mut st = self.panel_state();
+            (st.hot, st.pressed) = self.pointer(&info);
+            PANEL_HAND.store(st.hot.is_some(), Ordering::Relaxed);
             self.panel_dib.canvas().px.fill(0);
             let panel = ui::panel(Some(&mut self.panel_dib.canvas()), (0, 0), st, &self.settings, &info);
             self.text.draw(&mut self.panel_dib.canvas(), &panel.texts);
@@ -631,6 +685,22 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             }
             WM_LBUTTONUP if interactive => {
                 push(Ev::Up);
+                LRESULT(0)
+            }
+            // Hand over panel controls, move arrows over the draggable HUD.
+            WM_SETCURSOR if interactive && (lparam.0 & 0xFFFF) as u32 == HTCLIENT => {
+                let id = match which {
+                    Which::Panel if PANEL_HAND.load(Ordering::Relaxed) => IDC_HAND,
+                    Which::Panel => IDC_ARROW,
+                    Which::Hud => IDC_SIZEALL,
+                };
+                if let Ok(c) = LoadCursorW(None, id) {
+                    SetCursor(Some(c));
+                }
+                LRESULT(1)
+            }
+            WM_KEYDOWN if which == Which::Panel && wparam.0 == VK_ESCAPE.0 as usize => {
+                push(Ev::Escape);
                 LRESULT(0)
             }
             WM_SIZE => LRESULT(0), // size comes from the DIB (see `blit`)
@@ -703,6 +773,7 @@ fn main() -> windows::core::Result<()> {
             panel_pos: saved.panel,
             proc_name: (0, String::new()),
             store: store::Store::start(panel_hwnd),
+            undo: None,
         };
         app.place_hud(); // clamps a stale position on-screen, and centres crosshair mode
         app.push_dsp_settings();
