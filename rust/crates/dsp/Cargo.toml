@@ -1,6 +1,6 @@
 [package]
 name = "dsp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "DeafOverlay direction-of-arrival DSP (platform-free)"
 

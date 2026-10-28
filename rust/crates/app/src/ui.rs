@@ -611,6 +611,8 @@ fn setup(b: &mut Builder, mut y: i32, ix0: i32, ix1: i32, info: &SetupInfo) {
         ("Output", format!("{layout} · {n} ch"), GRAY_200),
         ("Direction", if full360 { "Full 360°".into() } else { "Front arc only".into() }, if full360 { GREEN_300 } else { ORANGE_300 }),
         ("Capturing", info.capture_name.clone().unwrap_or_else(|| "All system audio".into()), GRAY_200),
+        // for bug reports: "what does Setup say?"
+        ("Version", env!("CARGO_PKG_VERSION").into(), GRAY_200),
     ];
     if info.proc_unsupported {
         rows.push(("Game only", "Needs Win10 build 20348+".into(), ORANGE_300));
@@ -720,6 +722,11 @@ mod tests {
         }
         let s = Settings::default();
         assert!(panel(None, ORIGIN, st(View::Setup), &s, &info).slider_span(0).is_none());
+        // Setup's tallest case (stereo + the "Game only" row) keeps its text above the footer too
+        let p = panel(None, ORIGIN, st(View::Setup), &s, &info);
+        assert!(p.texts.iter().any(|t| t.s == env!("CARGO_PKG_VERSION")));
+        let lowest = p.texts.iter().filter(|t| !t.s.starts_with("ALT+H")).map(|t| t.y + 8.0).fold(0.0, f32::max);
+        assert!(lowest <= (ORIGIN.1 + PANEL_H - FOOTER_H) as f32, "Setup text runs into the footer");
     }
 
     #[test]

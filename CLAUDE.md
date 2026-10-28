@@ -84,6 +84,7 @@ A Cargo workspace that replaces the C++ app, with feature parity plus the new di
     - Store calls run on worker threads and report back over a channel (`poll()` each frame). The purchase dialog is owned by the panel window via `IInitializeWithWindow`, which keeps it above the topmost overlay.
     - Only a packaged (MSIX) run has a Store identity (`GetCurrentPackageFullName`). The plain exe shows "needs the Microsoft Store version" and the BackaBuddy link.
   - `persist.rs` handles settings persistence. It uses v1's file, keys and layout (`%APPDATA%\DeafOverlay\settings.json`), so both builds share one settings file. It reads with `serde_json` (clamped, and missing keys keep their defaults) and writes via a temp file plus rename. Saves happen after each change, window move, settings close and quit. The first-run flag is v1's `HKCU\Software\DeafOverlay\OnboardingDone`, and on first run the app opens the Setup view.
+  - The version lives only in `crates/app/Cargo.toml`. `build.rs` (`winresource`, a build-only dependency that needs the Windows SDK's `rc.exe`) stamps it into the exe's Properties > Details. The Setup view shows it too, and `build-msix.ps1` uses it for the package version.
   - `rust/.cargo/config.toml` links the C runtime statically, so `target/release/deafoverlay.exe` is one standalone file with no VC++ Redistributable needed.
   - `wnd_proc` only queues mouse events; the main loop handles them. The window-move loop is modal and re-enters `wnd_proc`, so handling input there would mean re-entrant access to the app state.
 
